@@ -245,7 +245,6 @@ class RodState:
         # Batched execution support
         self.batched_arrays: BatchedGPUArrays | None = None
         self.use_batched_step = False
-        self.sync_batched_arrays = True  # Sync between batched arrays and individual rods
 
         # CUDA graph support for batched step
         self.use_batched_cuda_graph = False
@@ -454,7 +453,6 @@ class RodState:
             float(dt),
             float(linear_damping),
             float(angular_damping),
-            bool(self.sync_batched_arrays),
         )
         if self._batched_graph is not None and self._batched_graph_params == params:
             return
@@ -516,24 +514,10 @@ class RodState:
 
         do_timing = self._enable_batched_timers
 
-        # Sync from individual rods to batched arrays (not graphable)
-        if self.sync_batched_arrays:
-            t0 = time.perf_counter()
-            b.sync_from_rods(self.rods)
-            if do_timing:
-                wp.synchronize_device(b.device)
-                self._record_batched_timing("1_sync_from", time.perf_counter() - t0)
-
         # Main kernel work with per-phase timing
+        # NOTE: We no longer sync between batched arrays and individual rod arrays.
+        # All operations (keyboard input, constraints, rendering) now use batched arrays directly.
         self._step_batched_impl_inner(dt, linear_damping, angular_damping, do_timing)
-
-        # Sync results back to individual rods (not graphable)
-        if self.sync_batched_arrays:
-            t0 = time.perf_counter()
-            b.sync_to_rods(self.rods)
-            if do_timing:
-                wp.synchronize_device(b.device)
-                self._record_batched_timing("9_sync_to", time.perf_counter() - t0)
 
         if do_timing:
             self._batched_timing_count += 1

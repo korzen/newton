@@ -89,6 +89,32 @@ def _warp_build_segment_lines(
     ends[idx] = positions[i + 1] + offset
 
 
+@wp.kernel
+def _warp_build_segment_lines_from_batched(
+    batched_positions: wp.array(dtype=wp.vec3),
+    batched_offset: int,
+    world_offset: wp.vec3,
+    output_start: int,
+    starts: wp.array(dtype=wp.vec3),
+    ends: wp.array(dtype=wp.vec3),
+):
+    """Build line segment endpoints from batched positions array.
+
+    Args:
+        batched_positions: Concatenated positions array for all rods.
+        batched_offset: Offset into batched_positions where this rod's data starts.
+        world_offset: World-space offset to apply for visualization.
+        output_start: Starting index in the output starts/ends arrays.
+        starts: Output array for segment start points.
+        ends: Output array for segment end points.
+    """
+    i = wp.tid()
+    src_idx = batched_offset + i
+    out_idx = output_start + i
+    starts[out_idx] = batched_positions[src_idx] + world_offset
+    ends[out_idx] = batched_positions[src_idx + 1] + world_offset
+
+
 # ==============================================================================
 # Floor collision
 # ==============================================================================
@@ -147,6 +173,36 @@ def _warp_apply_root_translation(
     positions[0] = new_pos
     predicted[0] = new_pos
     velocities[0] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def _warp_apply_root_translation_batched(
+    positions: wp.array(dtype=wp.vec3),
+    predicted: wp.array(dtype=wp.vec3),
+    velocities: wp.array(dtype=wp.vec3),
+    dx: float,
+    dy: float,
+    dz: float,
+    offset: int,
+):
+    """Apply translation to the root particle (batched array version).
+
+    Args:
+        positions: Batched positions array.
+        predicted: Batched predicted positions array.
+        velocities: Batched velocities array.
+        dx, dy, dz: Translation delta.
+        offset: Offset into batched arrays where this rod's data starts.
+    """
+    tid = wp.tid()
+    if tid != 0:
+        return
+    root_idx = offset
+    pos = positions[root_idx]
+    new_pos = wp.vec3(pos.x + dx, pos.y + dy, pos.z + dz)
+    positions[root_idx] = new_pos
+    predicted[root_idx] = new_pos
+    velocities[root_idx] = wp.vec3(0.0, 0.0, 0.0)
 
 
 @wp.kernel
@@ -883,6 +939,51 @@ def _warp_set_root_on_track(
     velocities[root_idx] = wp.vec3(0.0, 0.0, 0.0)
 
 
+@wp.kernel
+def _warp_set_root_on_track_batched(
+    positions: wp.array(dtype=wp.vec3),
+    predicted_positions: wp.array(dtype=wp.vec3),
+    velocities: wp.array(dtype=wp.vec3),
+    batched_offset: int,
+    track_start: wp.vec3,
+    track_end: wp.vec3,
+    insertion: float,
+):
+    """Set the root particle position along the track (batched array version).
+
+    Args:
+        positions: Batched positions array (updated in-place).
+        predicted_positions: Batched predicted positions array (updated in-place).
+        velocities: Batched velocities array (updated in-place).
+        batched_offset: Offset into batched arrays where this rod's data starts.
+        track_start: Start of the track.
+        track_end: End of the track.
+        insertion: Insertion depth along the track.
+    """
+    tid = wp.tid()
+    if tid != 0:
+        return
+
+    track_vec = track_end - track_start
+    track_length = wp.length(track_vec)
+
+    if track_length < 1.0e-10:
+        return
+
+    track_dir = track_vec / track_length
+
+    # Clamp insertion to valid range
+    clamped_insertion = wp.clamp(insertion, 0.0, track_length)
+
+    # Compute new root position
+    new_pos = track_start + track_dir * clamped_insertion
+
+    root_idx = batched_offset
+    positions[root_idx] = new_pos
+    predicted_positions[root_idx] = new_pos
+    velocities[root_idx] = wp.vec3(0.0, 0.0, 0.0)
+
+
 # ==============================================================================
 # Concentric constraint
 # ==============================================================================
@@ -1529,8 +1630,10 @@ __all__ = [
     "_warp_apply_direct_corrections",
     "_warp_apply_floor_collisions",
     "_warp_apply_root_translation",
+    "_warp_apply_root_translation_batched",
     "_warp_apply_track_sliding",
     "_warp_build_segment_lines",
+    "_warp_build_segment_lines_from_batched",
     "_warp_compute_corrections_batched",
     "_warp_compute_corrections_parallel",
     "_warp_compute_inv_inertia_world",
@@ -1548,6 +1651,7 @@ __all__ = [
     "_warp_copy_with_offset_batched",
     "_warp_merge_delta_lambda",
     "_warp_set_root_on_track",
+    "_warp_set_root_on_track_batched",
     "_warp_set_root_orientation",
     "_warp_update_velocities_from_positions",
     "_warp_zero_2d",

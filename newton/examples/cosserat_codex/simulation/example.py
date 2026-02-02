@@ -42,13 +42,16 @@ from newton.examples.cosserat_codex.constants import (
     TILE,
 )
 from newton.examples.cosserat_codex.kernels import (
+    _warp_apply_root_translation_batched,
     _warp_apply_track_sliding,
     _warp_build_segment_lines,
+    _warp_build_segment_lines_from_batched,
     _warp_copy_from_offset,
     _warp_copy_from_offset_batched,
     _warp_copy_with_offset,
     _warp_copy_with_offset_batched,
     _warp_set_root_on_track,
+    _warp_set_root_on_track_batched,
     _warp_update_velocities_from_positions,
     warp_concentric_constraint_direct,
 )
@@ -207,7 +210,6 @@ class Example:
         self.use_cuda_graph = args.use_cuda_graph
         self.use_parallel_kernels = True  # Toggle between parallel and sequential GPU kernels
         self.use_batched_step = True  # Toggle batched step for multiple rods
-        self.sync_batched_arrays = True  # Sync between batched arrays and individual rods
         self.use_batched_cuda_graph = False  # CUDA graph for batched step (per substep)
         self.use_frame_cuda_graph = False  # CUDA graph for entire frame (all substeps)
         self.enable_batched_timers = False  # Timing instrumentation for batched step
@@ -589,9 +591,12 @@ class Example:
         self._collision_inv_masses_np = np.zeros(total_particles, dtype=np.float32)
         self._collision_inv_masses_wp = wp.zeros(total_particles, dtype=wp.float32, device=device)
 
-        # Per-particle visualization colors and radii (updated each frame based on rod settings)
+        # Per-particle visualization colors and radii (cached on GPU, updated only when dirty)
         self._particle_colors_np = np.zeros((total_particles, 3), dtype=np.float32)
         self._particle_radii_np = np.zeros(total_particles, dtype=np.float32)
+        self._particle_colors_wp = wp.zeros(total_particles, dtype=wp.vec3, device=device)
+        self._particle_radii_wp = wp.zeros(total_particles, dtype=wp.float32, device=device)
+        self._particle_visuals_dirty = True  # Force initial sync
         self._update_particle_visuals()
 
         # Previous positions for collision velocity update
@@ -602,10 +607,15 @@ class Example:
             self._rod_positions_prev[0] if self._rod_positions_prev else np.zeros((0, 3), dtype=np.float32)
         )
         self._gpu_positions_prev = []
+        self._gpu_positions_prev_batched = None
         if self.gpu_state is not None:
             self._gpu_positions_prev = [
                 wp.zeros(rod.num_points, dtype=wp.vec3, device=device) for rod in self.gpu_state.rods
             ]
+            # Batched previous positions for velocity update (eliminates per-rod kernel launches)
+            if self.gpu_state.batched_arrays is not None:
+                total_points = self.gpu_state.batched_arrays.total_points
+                self._gpu_positions_prev_batched = wp.zeros(total_points, dtype=wp.vec3, device=device)
 
         # Pre-allocate GPU arrays for batched sync operations (reduces kernel launch overhead)
         # These are used by _sync_state_from_rods and constraint copy-back when batched_arrays exist
@@ -686,8 +696,13 @@ class Example:
                 offsets.append(self.rod_infos[idx].offset)
         return offsets
 
-    def _update_particle_visuals(self):
-        """Update per-particle colors and radii based on rod settings."""
+    def _update_particle_visuals(self, sync_to_gpu: bool = True):
+        """Update per-particle colors and radii based on rod settings.
+
+        Args:
+            sync_to_gpu: If True, immediately sync to GPU arrays. If False, only
+                update numpy arrays and set dirty flag for deferred sync.
+        """
         for idx, rod_info in enumerate(self.rod_infos):
             start = self._rod_point_starts[idx]
             end = start + rod_info.rod.num_points
@@ -695,6 +710,19 @@ class Example:
             self._particle_colors_np[start:end] = rod_info.particle_color
             # Set particle radii for this rod
             self._particle_radii_np[start:end] = rod_info.particle_radius
+
+        if sync_to_gpu:
+            self._sync_particle_visuals_to_gpu()
+
+    def _sync_particle_visuals_to_gpu(self):
+        """Sync particle colors and radii to cached GPU arrays."""
+        self._particle_colors_wp.assign(
+            wp.array(self._particle_colors_np, dtype=wp.vec3, device=self.model.device)
+        )
+        self._particle_radii_wp.assign(
+            wp.array(self._particle_radii_np, dtype=wp.float32, device=self.model.device)
+        )
+        self._particle_visuals_dirty = False
 
     def _update_gravity(self):
         if self.gravity_enabled:
@@ -740,8 +768,7 @@ class Example:
             batched = self.gpu_state.batched_arrays
             # Use batched kernel if batched arrays exist and GPU offsets warp array is ready
             if batched is not None and self._gpu_offsets_wp is not None:
-                # Ensure batched arrays are synced from individual rods first
-                batched.sync_from_rods(self.gpu_state.rods)
+                # Batched arrays are the single source of truth - copy directly to state.particle_q
                 total_gpu_points = batched.total_points
                 # Single kernel launch for all GPU rods - positions
                 wp.launch(
@@ -822,12 +849,21 @@ class Example:
             return
 
         # Store previous positions for all rods
+        batched = self.gpu_state.batched_arrays if self.gpu_state is not None else None
+        if batched is not None and self._gpu_positions_prev_batched is not None:
+            # Single copy for all GPU rods using batched arrays
+            wp.copy(self._gpu_positions_prev_batched, batched.positions_wp)
+        else:
+            # Fallback to per-rod copies
+            for idx, rod_info in enumerate(self.rod_infos):
+                rod = rod_info.rod
+                if rod_info.solver_type == SolverType.WARP:
+                    wp.copy(self._gpu_positions_prev[self.warp_rod_indices.index(idx)], rod.positions_wp)
+        # NumPy/DLL rods
         for idx, rod_info in enumerate(self.rod_infos):
-            rod = rod_info.rod
-            if rod_info.solver_type == SolverType.WARP:
-                wp.copy(self._gpu_positions_prev[self.warp_rod_indices.index(idx)], rod.positions_wp)
-            else:
-                self._rod_positions_prev[idx][:] = rod.positions[:, 0:3]
+            if rod_info.solver_type not in (SolverType.NUMPY, SolverType.DLL):
+                continue
+            self._rod_positions_prev[idx][:] = rod_info.rod.positions[:, 0:3]
 
         self._update_collision_inv_masses()
         if not skip_initial_sync:
@@ -881,26 +917,21 @@ class Example:
                 ],
                 device=self.model.device,
             )
-            # Sync batched arrays back to individual rods
-            batched.sync_to_rods(self.gpu_state.rods)
-
-            # Update velocities for GPU rods (still per-rod for now due to prev positions tracking)
-            for idx, rod_info in enumerate(self.rod_infos):
-                if rod_info.solver_type == SolverType.WARP:
-                    warp_idx = self.warp_rod_indices.index(idx)
-                    rod = rod_info.rod
-                    wp.launch(
-                        _warp_update_velocities_from_positions,
-                        dim=rod.num_points,
-                        inputs=[
-                            self._gpu_positions_prev[warp_idx],
-                            rod.positions_wp,
-                            rod.inv_masses_wp,
-                            float(dt),
-                            rod.velocities_wp,
-                        ],
-                        device=self.model.device,
-                    )
+            # Update velocities using batched arrays (single kernel launch for all GPU rods)
+            wp.launch(
+                _warp_update_velocities_from_positions,
+                dim=total_gpu_points,
+                inputs=[
+                    self._gpu_positions_prev_batched,
+                    batched.positions_wp,
+                    batched.inv_masses_wp,
+                    float(dt),
+                    batched.velocities_wp,
+                ],
+                device=self.model.device,
+            )
+            # NOTE: We intentionally skip sync_to_rods here.
+            # The batched arrays now have the correct data, and rendering reads directly from them.
         else:
             # Fall back to per-rod kernel launches for GPU rods
             for idx, rod_info in enumerate(self.rod_infos):
@@ -1001,21 +1032,41 @@ class Example:
             insertion = self.rod_insertions[idx] if idx < len(self.rod_insertions) else 0.0
 
             if rod_info.solver_type == SolverType.WARP:
-                # For Warp rods, use GPU kernel
-                wp.launch(
-                    _warp_set_root_on_track,
-                    dim=1,
-                    inputs=[
-                        rod.positions_wp,
-                        rod.predicted_positions_wp,
-                        rod.velocities_wp,
-                        track_start_wp,
-                        track_end_wp,
-                        float(insertion),
-                        0,
-                    ],
-                    device=self.model.device,
-                )
+                # For Warp rods, use batched arrays directly (no individual rod sync needed)
+                batched = self.gpu_state.batched_arrays if self.gpu_state is not None else None
+                if batched is not None:
+                    warp_local_idx = self.warp_rod_indices.index(idx)
+                    batched_offset = int(batched.batch.rod_offsets[warp_local_idx])
+                    wp.launch(
+                        _warp_set_root_on_track_batched,
+                        dim=1,
+                        inputs=[
+                            batched.positions_wp,
+                            batched.predicted_positions_wp,
+                            batched.velocities_wp,
+                            batched_offset,
+                            track_start_wp,
+                            track_end_wp,
+                            float(insertion),
+                        ],
+                        device=self.model.device,
+                    )
+                else:
+                    # Fallback to individual rod arrays if no batched arrays
+                    wp.launch(
+                        _warp_set_root_on_track,
+                        dim=1,
+                        inputs=[
+                            rod.positions_wp,
+                            rod.predicted_positions_wp,
+                            rod.velocities_wp,
+                            track_start_wp,
+                            track_end_wp,
+                            float(insertion),
+                            0,
+                        ],
+                        device=self.model.device,
+                    )
             else:
                 # For NumPy/DLL rods, apply insertion on CPU
                 track_dir = track_end - track_start
@@ -1089,10 +1140,10 @@ class Example:
                 ],
                 device=self.model.device,
             )
-            # Sync batched arrays back to individual rods
-            batched.sync_to_rods(self.gpu_state.rods)
+            # NOTE: We intentionally skip sync_to_rods here.
+            # The batched arrays now have the correct data, and rendering reads directly from them.
         else:
-            # Fall back to per-rod kernel launches for GPU rods
+            # Fall back to per-rod kernel launches for GPU rods (only when batched arrays unavailable)
             for idx, rod_info in enumerate(self.rod_infos):
                 if rod_info.solver_type == SolverType.WARP:
                     rod = rod_info.rod
@@ -1168,6 +1219,13 @@ class Example:
 
         # Launch kernel - iterates over INNER rod particles
         # Uses new v3 implementation with cleaner arc-length parametrization
+        # NOTE: This constraint still uses individual rod arrays, so we need to sync.
+        # TODO: Create a batched version of the concentric constraint kernel to avoid this sync.
+        batched = self.gpu_state.batched_arrays if self.gpu_state is not None else None
+        if batched is not None:
+            # Sync batched arrays to individual rod arrays for concentric constraint
+            batched.sync_to_rods(self.gpu_state.rods)
+
         wp.launch(
             warp_concentric_constraint_direct,
             dim=inner_rod.num_points,
@@ -1194,6 +1252,10 @@ class Example:
             ],
             device=self.model.device,
         )
+
+        # Sync back to batched arrays
+        if batched is not None:
+            batched.sync_from_rods(self.gpu_state.rods)
 
         self._force_sync_gpu = True
 
@@ -1419,7 +1481,6 @@ class Example:
             bool(self.floor_collision_enabled),
             float(self.floor_height),
             float(self.floor_restitution),
-            bool(self.gpu_state.sync_batched_arrays) if self.gpu_state else False,
         )
         if self._frame_graph is not None and self._frame_graph_params == params:
             return
@@ -1546,7 +1607,8 @@ class Example:
         delta = np.array([dx, dy, dz], dtype=np.float32)
 
         # Apply translation to all rods
-        for rod_info in self.rod_infos:
+        batched = self.gpu_state.batched_arrays if self.gpu_state is not None else None
+        for idx, rod_info in enumerate(self.rod_infos):
             rod = rod_info.rod
             if rod_info.solver_type in (SolverType.NUMPY, SolverType.DLL):
                 pos = rod.positions[0, 0:3]
@@ -1556,6 +1618,22 @@ class Example:
                 rod.velocities[0, 0:3] = 0.0
             elif rod_info.solver_type == SolverType.WARP:
                 rod.apply_root_translation(dx, dy, dz)
+                # Also update batched arrays directly (batched arrays are the source of truth)
+                if batched is not None:
+                    warp_local_idx = self.warp_rod_indices.index(idx)
+                    batched_offset = int(batched.batch.rod_offsets[warp_local_idx])
+                    wp.launch(
+                        _warp_apply_root_translation_batched,
+                        dim=1,
+                        inputs=[
+                            batched.positions_wp,
+                            batched.predicted_positions_wp,
+                            batched.velocities_wp,
+                            dx, dy, dz,
+                            batched_offset,
+                        ],
+                        device=self.model.device,
+                    )
 
         self._force_sync_reference = True
         self._force_sync_gpu = True
@@ -1593,6 +1671,23 @@ class Example:
             rod.velocities[0, 0:3] = 0.0
         elif rod_info.solver_type == SolverType.WARP:
             rod.apply_root_translation(float(delta[0]), float(delta[1]), float(delta[2]))
+            # Also update batched arrays directly (batched arrays are the source of truth)
+            batched = self.gpu_state.batched_arrays if self.gpu_state is not None else None
+            if batched is not None:
+                warp_local_idx = self.warp_rod_indices.index(rod_idx)
+                batched_offset = int(batched.batch.rod_offsets[warp_local_idx])
+                wp.launch(
+                    _warp_apply_root_translation_batched,
+                    dim=1,
+                    inputs=[
+                        batched.positions_wp,
+                        batched.predicted_positions_wp,
+                        batched.velocities_wp,
+                        float(delta[0]), float(delta[1]), float(delta[2]),
+                        batched_offset,
+                    ],
+                    device=self.model.device,
+                )
 
         self._force_sync_reference = True
         self._force_sync_gpu = True
@@ -1625,49 +1720,66 @@ class Example:
         self.viewer.log_state(self.state)
         self.viewer.show_particles = original_show_particles
 
-        # Render particles with per-rod colors and radii
+        # Render particles with per-rod colors and radii (use cached GPU arrays)
         if original_show_particles and self.model.particle_count > 0:
-            self._update_particle_visuals()
-            # Convert to warp arrays for GL viewer compatibility
-            radii_wp = wp.array(self._particle_radii_np, dtype=wp.float32, device=self.model.device)
-            colors_wp = wp.array(self._particle_colors_np, dtype=wp.vec3, device=self.model.device)
+            # Only sync to GPU when visuals have changed
+            if self._particle_visuals_dirty:
+                self._sync_particle_visuals_to_gpu()
             self.viewer.log_points(
                 name="/model/particles",
                 points=self.state.particle_q,
-                radii=radii_wp,
-                colors=colors_wp,
+                radii=self._particle_radii_wp,
+                colors=self._particle_colors_wp,
                 hidden=False,
             )
 
         # Render rod segments for all rods
         if self.show_segments:
+            batched = self.gpu_state.batched_arrays if self.gpu_state is not None else None
             for idx, rod_info in enumerate(self.rod_infos):
                 rod = rod_info.rod
                 offset = rod_info.offset
                 offset_wp = wp.vec3(float(offset[0]), float(offset[1]), float(offset[2]))
 
-                # Get positions array (NumPy/DLL use numpy arrays, Warp has positions_wp)
-                if rod_info.solver_type == SolverType.WARP:
-                    positions_wp = rod.positions_wp
+                # For Warp rods with batched arrays, read directly from batched arrays (no sync needed)
+                if rod_info.solver_type == SolverType.WARP and batched is not None:
+                    # Get local index within Warp rods
+                    warp_local_idx = self.warp_rod_indices.index(idx)
+                    batched_offset = int(batched.batch.rod_offsets[warp_local_idx])
+                    wp.launch(
+                        _warp_build_segment_lines_from_batched,
+                        dim=rod.num_points - 1,
+                        inputs=[
+                            batched.positions_wp,
+                            batched_offset,
+                            offset_wp,
+                            0,
+                            self._rod_segment_starts_wp[idx],
+                            self._rod_segment_ends_wp[idx],
+                        ],
+                        device=self.model.device,
+                    )
                 else:
-                    # Update warp array from numpy
-                    positions = rod.positions[:, 0:3].astype(np.float32)
-                    self._rod_positions_wp[idx].assign(wp.array(positions, dtype=wp.vec3, device=self.model.device))
-                    positions_wp = self._rod_positions_wp[idx]
-
-                # Build segment lines
-                wp.launch(
-                    _warp_build_segment_lines,
-                    dim=rod.num_points - 1,
-                    inputs=[
-                        positions_wp,
-                        offset_wp,
-                        0,
-                        self._rod_segment_starts_wp[idx],
-                        self._rod_segment_ends_wp[idx],
-                    ],
-                    device=self.model.device,
-                )
+                    # NumPy/DLL rods or no batched arrays - use individual rod arrays
+                    if rod_info.solver_type == SolverType.WARP:
+                        positions_wp = rod.positions_wp
+                    else:
+                        # Update warp array from numpy
+                        positions = rod.positions[:, 0:3].astype(np.float32)
+                        self._rod_positions_wp[idx].assign(wp.array(positions, dtype=wp.vec3, device=self.model.device))
+                        positions_wp = self._rod_positions_wp[idx]
+                    wp.launch(
+                        _warp_build_segment_lines,
+                        dim=rod.num_points - 1,
+                        inputs=[
+                            positions_wp,
+                            offset_wp,
+                            0,
+                            self._rod_segment_starts_wp[idx],
+                            self._rod_segment_ends_wp[idx],
+                        ],
+                        device=self.model.device,
+                    )
 
                 # Log lines for this rod
                 self.viewer.log_lines(
@@ -1774,9 +1886,6 @@ class Example:
             changed_batched, self.use_batched_step = ui.checkbox("Use Batched Step (Warp)", self.use_batched_step)
             if changed_batched:
                 self.use_batched_step = self.gpu_state.set_use_batched_step(self.use_batched_step)
-            changed_sync, self.sync_batched_arrays = ui.checkbox("Sync Batched Arrays", self.sync_batched_arrays)
-            if changed_sync:
-                self.gpu_state.sync_batched_arrays = self.sync_batched_arrays
             changed_batched_graph, self.use_batched_cuda_graph = ui.checkbox(
                 "Batched CUDA Graph", self.use_batched_cuda_graph
             )
@@ -2018,19 +2127,23 @@ class Example:
             for idx, rod_info in enumerate(self.rod_infos):
                 solver_name = rod_info.solver_type.value.upper()
                 ui.text(f"  Rod {idx} ({solver_name})")
-                _changed, rod_info.particle_radius = ui.slider_float(
+                changed_radius, rod_info.particle_radius = ui.slider_float(
                     f"  Rod{idx} Particle Radius", rod_info.particle_radius, 0.001, 0.05
                 )
                 # Color sliders for R, G, B
-                _changed_r, rod_info.particle_color[0] = ui.slider_float(
+                changed_r, rod_info.particle_color[0] = ui.slider_float(
                     f"  Rod{idx} Particle R", rod_info.particle_color[0], 0.0, 1.0
                 )
-                _changed_g, rod_info.particle_color[1] = ui.slider_float(
+                changed_g, rod_info.particle_color[1] = ui.slider_float(
                     f"  Rod{idx} Particle G", rod_info.particle_color[1], 0.0, 1.0
                 )
-                _changed_b, rod_info.particle_color[2] = ui.slider_float(
+                changed_b, rod_info.particle_color[2] = ui.slider_float(
                     f"  Rod{idx} Particle B", rod_info.particle_color[2], 0.0, 1.0
                 )
+                # Mark visuals dirty if any slider changed (deferred sync to render)
+                if changed_radius or changed_r or changed_g or changed_b:
+                    self._update_particle_visuals(sync_to_gpu=False)
+                    self._particle_visuals_dirty = True
 
         # Per-rod mesh rendering settings (only show when mesh is enabled)
         if self.show_rod_mesh:
