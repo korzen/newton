@@ -12,7 +12,8 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:nvidia.github.io)",
       "WebSearch",
-      "mcp__MaaS-GDrive__health_check"
+      "mcp__MaaS-GDrive__health_check",
+      "mcp__ide__getDiagnostics"
     ]
   },
   "sandbox": {

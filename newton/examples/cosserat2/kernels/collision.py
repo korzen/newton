@@ -195,7 +195,157 @@ def collide_particles_vs_triangles_bvh_kernel(
         signed_dist = wp.dot(tri_normal, pos - v0)
 
         # Narrowphase: find closest point on triangle to particle center
-        closest_p, bary, feature_type = triangle_closest_point(v0, v1, v2, pos_local)
+        closest_p, _bary, _feature_type = triangle_closest_point(v0, v1, v2, pos_local)
+
+        # Compute distance from particle center to closest point
+        to_particle = pos_local - closest_p
+        dist = wp.length(to_particle)
+        penetration = radius - dist
+
+        if dist < radius:
+            if use_two_sided:
+                if signed_dist < 0.0:
+                    # Sphere is on backface - push it to front side
+                    pos_local = closest_p + tri_normal * radius
+                else:
+                    # Sphere is on frontface but penetrating - standard collision response
+                    if dist > 1e-8:
+                        correction_dir = to_particle / dist
+                    else:
+                        correction_dir = tri_normal
+            else:
+                if dist > 1e-8:
+                    correction_dir = to_particle / dist
+                else:
+                    correction_dir = tri_normal
+
+            # Compute position correction to resolve penetration (PBD stiffness = 1)
+            correction = correction_dir * penetration
+            total_correction = total_correction + correction
+            num_collisions = num_collisions + 1
+            pos_local = pos_local + correction
+
+    if use_gauss_seidel:
+        particle_q_out[tid] = pos_local
+    else:
+        # Average corrections if multiple collisions (Jacobi-style)
+        if num_collisions > 0:
+            avg_correction = total_correction / wp.float32(num_collisions)
+            particle_q_out[tid] = pos + avg_correction
+
+
+@wp.kernel
+def compute_bvh_group_roots_kernel(
+    bvh_id: wp.uint64,
+    num_envs: int,
+    group_roots: wp.array(dtype=wp.int32),
+):
+    """Compute BVH group roots for each environment.
+
+    Uses Warp v1.11's group-aware BVH feature to get per-environment
+    root nodes for restricted queries.
+
+    Args:
+        bvh_id: BVH identifier.
+        num_envs: Number of environments.
+        group_roots: Output array of group root indices (one per environment).
+    """
+    env_id = wp.tid()
+    if env_id < num_envs:
+        group_roots[env_id] = wp.bvh_get_group_root(bvh_id, env_id)
+
+
+@wp.kernel
+def collide_particles_vs_triangles_bvh_grouped_kernel(
+    particle_q: wp.array(dtype=wp.vec3f),
+    particle_radius: wp.array(dtype=wp.float32),
+    particle_inv_mass: wp.array(dtype=wp.float32),
+    particle_env_id: wp.array(dtype=wp.int32),
+    tri_vertices: wp.array(dtype=wp.vec3f),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    bvh_id: wp.uint64,
+    bvh_group_roots: wp.array(dtype=wp.int32),
+    use_gauss_seidel: wp.bool,
+    use_two_sided: wp.bool,
+    # outputs
+    particle_q_out: wp.array(dtype=wp.vec3f),
+):
+    """Particle vs triangles collision kernel with per-environment BVH queries.
+
+    Same as collide_particles_vs_triangles_bvh_kernel but uses group-restricted
+    BVH queries to only check triangles belonging to the particle's environment.
+    This is essential for multi-environment simulations where each environment
+    has its own copy of the vessel mesh.
+
+    Args:
+        particle_q: Current particle positions.
+        particle_radius: Radius of each particle.
+        particle_inv_mass: Inverse mass of each particle (0 = kinematic/static).
+        particle_env_id: Environment ID for each particle.
+        tri_vertices: Vertex positions of all triangle meshes (concatenated).
+        tri_indices: Triangle indices (num_triangles x 3).
+        bvh_id: BVH identifier for broadphase queries.
+        bvh_group_roots: Per-environment BVH root nodes.
+        use_gauss_seidel: Apply per-triangle corrections immediately when true.
+        use_two_sided: Handle both front and back face penetrations.
+        particle_q_out: Output particle positions after collision response.
+    """
+    tid = wp.tid()
+
+    inv_mass = particle_inv_mass[tid]
+
+    # Skip kinematic particles
+    if inv_mass <= 0.0:
+        particle_q_out[tid] = particle_q[tid]
+        return
+
+    pos = particle_q[tid]
+    radius = particle_radius[tid]
+
+    # Get environment-specific BVH root
+    env_id = particle_env_id[tid]
+    root = bvh_group_roots[env_id]
+
+    # Query BVH for triangles within particle's bounding sphere
+    query_margin = radius * 1.5  # Small margin for robustness
+    lower = wp.vec3f(
+        pos[0] - query_margin,
+        pos[1] - query_margin,
+        pos[2] - query_margin,
+    )
+    upper = wp.vec3f(
+        pos[0] + query_margin,
+        pos[1] + query_margin,
+        pos[2] + query_margin,
+    )
+
+    # Broadphase: query BVH for potentially colliding triangles (group-restricted)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root)
+    tri_idx = wp.int32(0)
+
+    # Gauss-Seidel: apply each correction immediately to the local position.
+    pos_local = pos
+    total_correction = wp.vec3f(0.0, 0.0, 0.0)
+    num_collisions = wp.int32(0)
+    while wp.bvh_query_next(query, tri_idx):
+        # Get triangle vertex indices
+        i0 = tri_indices[tri_idx, 0]
+        i1 = tri_indices[tri_idx, 1]
+        i2 = tri_indices[tri_idx, 2]
+
+        # Get triangle vertex positions
+        v0 = tri_vertices[i0]
+        v1 = tri_vertices[i1]
+        v2 = tri_vertices[i2]
+
+        # Compute triangle normal (defines front face direction)
+        tri_normal = compute_triangle_normal(v0, v1, v2)
+
+        # Signed distance from triangle plane (positive = front side, negative = back side)
+        signed_dist = wp.dot(tri_normal, pos - v0)
+
+        # Narrowphase: find closest point on triangle to particle center
+        closest_p, _bary, _feature_type = triangle_closest_point(v0, v1, v2, pos_local)
 
         # Compute distance from particle center to closest point
         to_particle = pos_local - closest_p

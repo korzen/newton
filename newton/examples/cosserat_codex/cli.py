@@ -147,6 +147,19 @@ def create_parser():
             "If fewer solvers than --rod-count, the last solver type is repeated."
         ),
     )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help="Number of parallel environments (default: 1).",
+    )
+    parser.add_argument(
+        "--env-offset",
+        type=float,
+        nargs=3,
+        default=[5.0, 0.0, 0.0],
+        help="World offset between environments (x y z).",
+    )
     return parser
 
 

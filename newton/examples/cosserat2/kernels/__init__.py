@@ -13,7 +13,9 @@ from newton.examples.cosserat2.kernels.bend_twist import (
     solve_bend_twist_with_strain_rate_damping_kernel,
 )
 from newton.examples.cosserat2.kernels.collision import (
+    collide_particles_vs_triangles_bvh_grouped_kernel,
     collide_particles_vs_triangles_bvh_kernel,
+    compute_bvh_group_roots_kernel,
     compute_static_tri_aabbs_kernel,
     compute_triangle_normal,
     solve_ground_collision_kernel,
@@ -92,6 +94,8 @@ __all__ = [
     "compute_static_tri_aabbs_kernel",
     "compute_triangle_normal",
     "collide_particles_vs_triangles_bvh_kernel",
+    "collide_particles_vs_triangles_bvh_grouped_kernel",
+    "compute_bvh_group_roots_kernel",
     # Visualization
     "compute_director_lines_kernel",
     "update_rest_darboux_kernel",

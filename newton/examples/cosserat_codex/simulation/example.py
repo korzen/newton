@@ -30,7 +30,9 @@ from pxr import Usd
 import newton
 import newton.usd
 from newton.examples.cosserat2.kernels.collision import (
+    collide_particles_vs_triangles_bvh_grouped_kernel,
     collide_particles_vs_triangles_bvh_kernel,
+    compute_bvh_group_roots_kernel,
     compute_static_tri_aabbs_kernel,
 )
 from newton.examples.cosserat_codex.cli import SolverType, build_rod_configs, parse_solver_types
@@ -138,6 +140,10 @@ class Example:
         self.rod_count = max(int(args.rod_count), 1)
         self.rod_spacing = float(args.rod_spacing)
         self.mesh_offset = np.zeros(3, dtype=np.float32)
+
+        # Multi-environment configuration
+        self.num_envs = max(int(args.num_envs), 1)
+        self.env_offset = np.array(args.env_offset, dtype=np.float32)
 
         self.base_gravity = np.array(args.gravity, dtype=np.float32)
         self.gravity_enabled = False
@@ -253,8 +259,25 @@ class Example:
 
         rod_radius = args.rod_radius if args.rod_radius is not None else args.particle_radius
 
-        # Build configs for all rods
-        all_configs = build_rod_configs(args)
+        # Build configs for all rods (base configs, will be duplicated per env)
+        base_configs = build_rod_configs(args)
+        base_solver_types = parse_solver_types(args.rod_solvers, args.rod_count)
+
+        # Duplicate configs and solver types for each environment
+        all_configs = []
+        all_solver_types = []
+        self._rod_env_id = []  # Environment ID for each rod
+
+        for env_id in range(self.num_envs):
+            for config in base_configs:
+                all_configs.append(config)
+            for solver_type in base_solver_types:
+                all_solver_types.append(solver_type)
+            for _ in range(len(base_configs)):
+                self._rod_env_id.append(env_id)
+
+        # Update solver_types to include all rods across all environments
+        self.solver_types = all_solver_types
 
         # Track color usage per solver type
         solver_type_counts = {SolverType.NUMPY: 0, SolverType.WARP: 0, SolverType.DLL: 0}
@@ -264,8 +287,10 @@ class Example:
         self.dll_rods: list[DefKitDirectRodState] = []
         warp_configs: list[RodConfig] = []
         warp_indices: list[int] = []  # Track which indices are Warp rods
+        warp_env_ids: list[int] = []  # Environment ID for each Warp rod
 
-        for idx, (solver_type, config) in enumerate(zip(self.solver_types, all_configs, strict=True)):
+        for idx, (solver_type, config) in enumerate(zip(all_solver_types, all_configs, strict=True)):
+            env_id = self._rod_env_id[idx]
             # Determine color for this rod
             type_count = solver_type_counts[solver_type]
             if type_count == 0:
@@ -337,6 +362,7 @@ class Example:
             else:  # SolverType.WARP
                 warp_configs.append(config)
                 warp_indices.append(idx)
+                warp_env_ids.append(env_id)
                 # Rod info will be added after GPU state creation
                 self.rod_infos.append(None)  # Placeholder
 
@@ -453,13 +479,25 @@ class Example:
             has_shape_collision=False,
             has_particle_collision=False,
         )
-        builder.add_shape_mesh(
-            body=-1,
-            mesh=vessel_mesh,
-            scale=(self.mesh_scale, self.mesh_scale, self.mesh_scale),
-            xform=self.mesh_xform,
-            cfg=vessel_cfg,
-        )
+        # Add vessel mesh for each environment with appropriate offset
+        for env_id in range(self.num_envs):
+            env_world_offset = self.env_offset * env_id
+            # Combine base transform with environment offset
+            env_xform = wp.transform(
+                wp.vec3(
+                    self.mesh_xform.p[0] + env_world_offset[0],
+                    self.mesh_xform.p[1] + env_world_offset[1],
+                    self.mesh_xform.p[2] + env_world_offset[2],
+                ),
+                self.mesh_xform.q,
+            )
+            builder.add_shape_mesh(
+                body=-1,
+                mesh=vessel_mesh,
+                scale=(self.mesh_scale, self.mesh_scale, self.mesh_scale),
+                xform=env_xform,
+                cfg=vessel_cfg,
+            )
 
         # Add particles for all rods
         self._rod_point_starts = []
@@ -567,25 +605,8 @@ class Example:
         self._gpu_segment_ends_wp = wp.zeros(max(1, gpu_edge_count), dtype=wp.vec3, device=device)
         self._gpu_segment_colors_wp = wp.array(self._gpu_segment_colors, dtype=wp.vec3, device=device)
 
-        scaled_vertices = self.vessel_vertices_np * self.mesh_scale
-        transformed_vertices = np.zeros_like(scaled_vertices)
-        for i in range(len(scaled_vertices)):
-            v = wp.vec3(scaled_vertices[i, 0], scaled_vertices[i, 1], scaled_vertices[i, 2])
-            v_transformed = wp.transform_point(self.mesh_xform, v)
-            transformed_vertices[i] = [v_transformed[0], v_transformed[1], v_transformed[2]]
-
-        self.vessel_vertices = wp.array(transformed_vertices, dtype=wp.vec3f, device=device)
-        self.vessel_indices = wp.array(self.vessel_indices_np, dtype=wp.int32, device=device)
-        self.tri_lower_bounds = wp.zeros(self.num_vessel_triangles, dtype=wp.vec3f, device=device)
-        self.tri_upper_bounds = wp.zeros(self.num_vessel_triangles, dtype=wp.vec3f, device=device)
-        wp.launch(
-            kernel=compute_static_tri_aabbs_kernel,
-            dim=self.num_vessel_triangles,
-            inputs=[self.vessel_vertices, self.vessel_indices],
-            outputs=[self.tri_lower_bounds, self.tri_upper_bounds],
-            device=device,
-        )
-        self.vessel_bvh = wp.Bvh(self.tri_lower_bounds, self.tri_upper_bounds)
+        # Set up mesh for all environments (duplicated with offsets)
+        self._setup_multi_env_mesh(device)
 
         total_particles = self.model.particle_count
         self._collision_radii_wp = wp.array(
@@ -595,6 +616,18 @@ class Example:
         )
         self._collision_inv_masses_np = np.zeros(total_particles, dtype=np.float32)
         self._collision_inv_masses_wp = wp.zeros(total_particles, dtype=wp.float32, device=device)
+
+        # Build particle-to-environment mapping for multi-env collision
+        if self.num_envs > 1:
+            particle_env_id_np = np.zeros(total_particles, dtype=np.int32)
+            for idx, rod_info in enumerate(self.rod_infos):
+                start = self._rod_point_starts[idx]
+                end = start + rod_info.rod.num_points
+                env_id = self._rod_env_id[idx] if idx < len(self._rod_env_id) else 0
+                particle_env_id_np[start:end] = env_id
+            self._particle_env_id_wp = wp.array(particle_env_id_np, dtype=wp.int32, device=device)
+        else:
+            self._particle_env_id_wp = None
 
         # Per-particle visualization colors and radii (cached on GPU, updated only when dirty)
         self._particle_colors_np = np.zeros((total_particles, 3), dtype=np.float32)
@@ -629,9 +662,7 @@ class Example:
         self._gpu_particle_start_indices_wp = None
         if self.gpu_state is not None and self.gpu_state.batched_arrays is not None:
             # Build offsets array for GPU rods (vec3 per rod)
-            gpu_offsets_np = np.array(
-                [[o[0], o[1], o[2]] for o in self.gpu_offsets], dtype=np.float32
-            )
+            gpu_offsets_np = np.array([[o[0], o[1], o[2]] for o in self.gpu_offsets], dtype=np.float32)
             self._gpu_offsets_wp = wp.array(gpu_offsets_np, dtype=wp.vec3, device=device)
 
             # Pre-allocate zero offsets array for velocity sync (avoids per-frame allocation)
@@ -677,12 +708,19 @@ class Example:
             self.gpu_state.destroy()
 
     def _update_offsets(self):
-        """Update world offsets for all rods based on spacing."""
-        # Compute X offsets for spacing rods along X axis
-        x_offsets = compute_linear_offsets(len(self.rod_infos), self.rod_spacing)
+        """Update world offsets for all rods based on spacing and environment."""
+        # Compute X offsets for spacing rods along X axis within each environment
+        rods_per_env = len(self.rod_infos) // max(self.num_envs, 1)
+        base_x_offsets = compute_linear_offsets(rods_per_env, self.rod_spacing) if rods_per_env > 0 else []
 
-        for rod_info, x_offset in zip(self.rod_infos, x_offsets, strict=True):
-            rod_info.offset = self.mesh_offset + np.array([x_offset, 0.0, 0.0], dtype=np.float32)
+        for idx, rod_info in enumerate(self.rod_infos):
+            env_id = self._rod_env_id[idx] if idx < len(self._rod_env_id) else 0
+            local_rod_idx = idx % rods_per_env if rods_per_env > 0 else 0
+            x_offset = base_x_offsets[local_rod_idx] if local_rod_idx < len(base_x_offsets) else 0.0
+
+            # Combine mesh offset, rod spacing, and environment offset
+            env_world_offset = self.env_offset * env_id
+            rod_info.offset = self.mesh_offset + np.array([x_offset, 0.0, 0.0], dtype=np.float32) + env_world_offset
 
         # Backward compatibility: ref_offset is first rod's offset
         self.ref_offset = self.rod_infos[0].offset if self.rod_infos else self.mesh_offset.copy()
@@ -693,9 +731,7 @@ class Example:
 
         # Update GPU offsets warp array if it exists (for batched sync)
         if hasattr(self, "_gpu_offsets_wp") and self._gpu_offsets_wp is not None and self.gpu_offsets:
-            gpu_offsets_np = np.array(
-                [[o[0], o[1], o[2]] for o in self.gpu_offsets], dtype=np.float32
-            )
+            gpu_offsets_np = np.array([[o[0], o[1], o[2]] for o in self.gpu_offsets], dtype=np.float32)
             self._gpu_offsets_wp.assign(wp.array(gpu_offsets_np, dtype=wp.vec3, device=self.model.device))
 
     def _build_gpu_offsets(self):
@@ -705,6 +741,116 @@ class Example:
             if idx < len(self.rod_infos):
                 offsets.append(self.rod_infos[idx].offset)
         return offsets
+
+    def _setup_multi_env_mesh(self, device):
+        """Set up vessel mesh for all environments with per-env BVH groups.
+
+        For each environment (0..num_envs-1):
+        - Copies and offsets vertices by env_id * env_offset
+        - Offsets triangle indices by env_id * num_base_vertices
+        - Creates tri_env_id array mapping each triangle to its environment
+        - Builds BVH with groups for efficient per-environment queries
+        - Computes BVH group roots for each environment
+
+        Args:
+            device: Warp device for GPU arrays.
+        """
+        # Transform base mesh vertices
+        scaled_vertices = self.vessel_vertices_np * self.mesh_scale
+        base_transformed = np.zeros_like(scaled_vertices)
+        for i in range(len(scaled_vertices)):
+            v = wp.vec3(scaled_vertices[i, 0], scaled_vertices[i, 1], scaled_vertices[i, 2])
+            v_transformed = wp.transform_point(self.mesh_xform, v)
+            base_transformed[i] = [v_transformed[0], v_transformed[1], v_transformed[2]]
+
+        num_base_vertices = len(base_transformed)
+        num_base_triangles = self.num_vessel_triangles
+
+        if self.num_envs == 1:
+            # Single environment - use original mesh without groups
+            self.vessel_vertices = wp.array(base_transformed, dtype=wp.vec3f, device=device)
+            self.vessel_indices = wp.array(self.vessel_indices_np, dtype=wp.int32, device=device)
+            self.tri_lower_bounds = wp.zeros(num_base_triangles, dtype=wp.vec3f, device=device)
+            self.tri_upper_bounds = wp.zeros(num_base_triangles, dtype=wp.vec3f, device=device)
+            wp.launch(
+                kernel=compute_static_tri_aabbs_kernel,
+                dim=num_base_triangles,
+                inputs=[self.vessel_vertices, self.vessel_indices],
+                outputs=[self.tri_lower_bounds, self.tri_upper_bounds],
+                device=device,
+            )
+            self.vessel_bvh = wp.Bvh(self.tri_lower_bounds, self.tri_upper_bounds)
+            # Single env: particle_env_id not needed
+            self._particle_env_id_wp = None
+            self._bvh_group_roots_wp = None
+            self._tri_env_id = None
+        else:
+            # Multi-environment - duplicate mesh for each environment
+            total_vertices = num_base_vertices * self.num_envs
+            total_triangles = num_base_triangles * self.num_envs
+
+            # Allocate arrays for all environments
+            all_vertices = np.zeros((total_vertices, 3), dtype=np.float32)
+            all_indices = np.zeros((total_triangles, 3), dtype=np.int32)
+            tri_env_id = np.zeros(total_triangles, dtype=np.int32)
+
+            # Duplicate mesh for each environment
+            for env_id in range(self.num_envs):
+                # Compute per-environment offset
+                env_world_offset = self.env_offset * env_id
+
+                # Copy and offset vertices
+                v_start = env_id * num_base_vertices
+                v_end = v_start + num_base_vertices
+                all_vertices[v_start:v_end] = base_transformed + env_world_offset
+
+                # Copy and offset triangle indices
+                t_start = env_id * num_base_triangles
+                t_end = t_start + num_base_triangles
+                all_indices[t_start:t_end] = self.vessel_indices_np + (env_id * num_base_vertices)
+
+                # Set triangle environment IDs
+                tri_env_id[t_start:t_end] = env_id
+
+            # Create GPU arrays
+            self.vessel_vertices = wp.array(all_vertices, dtype=wp.vec3f, device=device)
+            self.vessel_indices = wp.array(all_indices, dtype=wp.int32, device=device)
+
+            # Compute AABBs for all triangles
+            self.tri_lower_bounds = wp.zeros(total_triangles, dtype=wp.vec3f, device=device)
+            self.tri_upper_bounds = wp.zeros(total_triangles, dtype=wp.vec3f, device=device)
+            wp.launch(
+                kernel=compute_static_tri_aabbs_kernel,
+                dim=total_triangles,
+                inputs=[self.vessel_vertices, self.vessel_indices],
+                outputs=[self.tri_lower_bounds, self.tri_upper_bounds],
+                device=device,
+            )
+
+            # Create BVH with per-environment groups
+            self._tri_env_id = tri_env_id
+            tri_env_id_wp = wp.array(tri_env_id, dtype=wp.int32, device=device)
+            self.vessel_bvh = wp.Bvh(self.tri_lower_bounds, self.tri_upper_bounds, groups=tri_env_id_wp)
+
+            # Compute BVH group roots for each environment
+            self._bvh_group_roots_wp = wp.zeros(self.num_envs, dtype=wp.int32, device=device)
+            wp.launch(
+                kernel=compute_bvh_group_roots_kernel,
+                dim=self.num_envs,
+                inputs=[self.vessel_bvh.id, self.num_envs],
+                outputs=[self._bvh_group_roots_wp],
+                device=device,
+            )
+
+            # Store environment offsets on GPU for constraint handling
+            self._env_offsets_wp = wp.array(
+                [self.env_offset * env_id for env_id in range(self.num_envs)],
+                dtype=wp.vec3,
+                device=device,
+            )
+
+        # Store total triangle count for multi-env
+        self.total_vessel_triangles = num_base_triangles if self.num_envs == 1 else num_base_triangles * self.num_envs
 
     def _update_particle_visuals(self, sync_to_gpu: bool = True):
         """Update per-particle colors and radii based on rod settings.
@@ -726,12 +872,8 @@ class Example:
 
     def _sync_particle_visuals_to_gpu(self):
         """Sync particle colors and radii to cached GPU arrays."""
-        self._particle_colors_wp.assign(
-            wp.array(self._particle_colors_np, dtype=wp.vec3, device=self.model.device)
-        )
-        self._particle_radii_wp.assign(
-            wp.array(self._particle_radii_np, dtype=wp.float32, device=self.model.device)
-        )
+        self._particle_colors_wp.assign(wp.array(self._particle_colors_np, dtype=wp.vec3, device=self.model.device))
+        self._particle_radii_wp.assign(wp.array(self._particle_radii_np, dtype=wp.float32, device=self.model.device))
         self._particle_visuals_dirty = False
 
     def _update_gravity(self):
@@ -877,22 +1019,43 @@ class Example:
         if not skip_initial_sync:
             self._sync_state_from_rods(force=True)
 
-        wp.launch(
-            kernel=collide_particles_vs_triangles_bvh_kernel,
-            dim=self.model.particle_count,
-            inputs=[
-                self.state.particle_q,
-                self._collision_radii_wp,
-                self._collision_inv_masses_wp,
-                self.vessel_vertices,
-                self.vessel_indices,
-                self.vessel_bvh.id,
-                self.use_gauss_seidel,
-                self.use_two_sided,
-            ],
-            outputs=[self.state.particle_q],
-            device=self.model.device,
-        )
+        # Use grouped kernel for multi-environment, standard kernel for single environment
+        if self.num_envs > 1 and self._particle_env_id_wp is not None and self._bvh_group_roots_wp is not None:
+            wp.launch(
+                kernel=collide_particles_vs_triangles_bvh_grouped_kernel,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.state.particle_q,
+                    self._collision_radii_wp,
+                    self._collision_inv_masses_wp,
+                    self._particle_env_id_wp,
+                    self.vessel_vertices,
+                    self.vessel_indices,
+                    self.vessel_bvh.id,
+                    self._bvh_group_roots_wp,
+                    self.use_gauss_seidel,
+                    self.use_two_sided,
+                ],
+                outputs=[self.state.particle_q],
+                device=self.model.device,
+            )
+        else:
+            wp.launch(
+                kernel=collide_particles_vs_triangles_bvh_kernel,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.state.particle_q,
+                    self._collision_radii_wp,
+                    self._collision_inv_masses_wp,
+                    self.vessel_vertices,
+                    self.vessel_indices,
+                    self.vessel_bvh.id,
+                    self.use_gauss_seidel,
+                    self.use_two_sided,
+                ],
+                outputs=[self.state.particle_q],
+                device=self.model.device,
+            )
 
         # Copy back to all rods
         # Use batched kernel for GPU rods if batched arrays are available
@@ -1637,7 +1800,9 @@ class Example:
                             batched.positions_wp,
                             batched.predicted_positions_wp,
                             batched.velocities_wp,
-                            dx, dy, dz,
+                            dx,
+                            dy,
+                            dz,
                             batched_offset,
                         ],
                         device=self.model.device,
@@ -1691,7 +1856,9 @@ class Example:
                         batched.positions_wp,
                         batched.predicted_positions_wp,
                         batched.velocities_wp,
-                        float(delta[0]), float(delta[1]), float(delta[2]),
+                        float(delta[0]),
+                        float(delta[1]),
+                        float(delta[2]),
                         batched_offset,
                     ],
                     device=self.model.device,
