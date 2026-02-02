@@ -7,7 +7,7 @@ uv run --extra examples ./newton/examples/cosserat_codex/xcath.py \
     --particle-radius 0.02 \
     --use-cuda-graph \
     --rod-solvers warp \
-    --rod-count 2 \
-    --num-envs 64 \
-    --env-offset 0.0 3.0 0.0 \
+    --rod-count 1 \
+    --num-envs 8 8 \
+    --env-offset 10.0 5.0 \
     "$@"  # Pass any additional arguments

@@ -150,15 +150,16 @@ def create_parser():
     parser.add_argument(
         "--num-envs",
         type=int,
-        default=1,
-        help="Number of parallel environments (default: 1).",
+        nargs="+",
+        default=[1],
+        help="Number of environments as grid dimensions (X) or (X Y). Default: 1.",
     )
     parser.add_argument(
         "--env-offset",
         type=float,
-        nargs=3,
-        default=[5.0, 0.0, 0.0],
-        help="World offset between environments (x y z).",
+        nargs=2,
+        default=[5.0, 5.0],
+        help="Spacing between environments along X and Y grid axes.",
     )
     return parser
 

@@ -141,9 +141,16 @@ class Example:
         self.rod_spacing = float(args.rod_spacing)
         self.mesh_offset = np.zeros(3, dtype=np.float32)
 
-        # Multi-environment configuration
-        self.num_envs = max(int(args.num_envs), 1)
-        self.env_offset = np.array(args.env_offset, dtype=np.float32)
+        # Multi-environment configuration (2D grid layout)
+        env_dims = args.num_envs if isinstance(args.num_envs, list) else [args.num_envs]
+        self.env_grid_x = max(int(env_dims[0]), 1)
+        self.env_grid_y = max(int(env_dims[1]), 1) if len(env_dims) > 1 else 1
+        self.num_envs = self.env_grid_x * self.env_grid_y
+        # Spacing between environments along X and Y axes
+        self.env_spacing = np.array(
+            [args.env_offset[0], args.env_offset[1] if len(args.env_offset) > 1 else args.env_offset[0]],
+            dtype=np.float32,
+        )
 
         self.base_gravity = np.array(args.gravity, dtype=np.float32)
         self.gravity_enabled = False
@@ -481,7 +488,7 @@ class Example:
         )
         # Add vessel mesh for each environment with appropriate offset
         for env_id in range(self.num_envs):
-            env_world_offset = self.env_offset * env_id
+            env_world_offset = self._get_env_world_offset(env_id)
             # Combine base transform with environment offset
             env_xform = wp.transform(
                 wp.vec3(
@@ -707,6 +714,22 @@ class Example:
         if hasattr(self, "gpu_state") and self.gpu_state is not None:
             self.gpu_state.destroy()
 
+    def _get_env_world_offset(self, env_id: int) -> np.ndarray:
+        """Compute world offset for an environment based on its 2D grid position.
+
+        Args:
+            env_id: Environment index (0 to num_envs-1).
+
+        Returns:
+            3D world offset as numpy array.
+        """
+        grid_x = env_id % self.env_grid_x
+        grid_y = env_id // self.env_grid_x
+        return np.array(
+            [grid_x * self.env_spacing[0], grid_y * self.env_spacing[1], 0.0],
+            dtype=np.float32,
+        )
+
     def _update_offsets(self):
         """Update world offsets for all rods based on spacing and environment."""
         # Compute X offsets for spacing rods along X axis within each environment
@@ -719,7 +742,7 @@ class Example:
             x_offset = base_x_offsets[local_rod_idx] if local_rod_idx < len(base_x_offsets) else 0.0
 
             # Combine mesh offset, rod spacing, and environment offset
-            env_world_offset = self.env_offset * env_id
+            env_world_offset = self._get_env_world_offset(env_id)
             rod_info.offset = self.mesh_offset + np.array([x_offset, 0.0, 0.0], dtype=np.float32) + env_world_offset
 
         # Backward compatibility: ref_offset is first rod's offset
@@ -745,8 +768,9 @@ class Example:
     def _setup_multi_env_mesh(self, device):
         """Set up vessel mesh for all environments with per-env BVH groups.
 
-        For each environment (0..num_envs-1):
-        - Copies and offsets vertices by env_id * env_offset
+        Environments are laid out on a 2D grid (env_grid_x × env_grid_y).
+        For each environment:
+        - Copies and offsets vertices based on grid position
         - Offsets triangle indices by env_id * num_base_vertices
         - Creates tri_env_id array mapping each triangle to its environment
         - Builds BVH with groups for efficient per-environment queries
@@ -797,7 +821,7 @@ class Example:
             # Duplicate mesh for each environment
             for env_id in range(self.num_envs):
                 # Compute per-environment offset
-                env_world_offset = self.env_offset * env_id
+                env_world_offset = self._get_env_world_offset(env_id)
 
                 # Copy and offset vertices
                 v_start = env_id * num_base_vertices
@@ -844,7 +868,7 @@ class Example:
 
             # Store environment offsets on GPU for constraint handling
             self._env_offsets_wp = wp.array(
-                [self.env_offset * env_id for env_id in range(self.num_envs)],
+                [self._get_env_world_offset(env_id) for env_id in range(self.num_envs)],
                 dtype=wp.vec3,
                 device=device,
             )
