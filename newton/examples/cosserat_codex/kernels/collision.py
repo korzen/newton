@@ -150,6 +150,41 @@ def _warp_apply_floor_collisions(
             velocities[i] = wp.vec3(vel.x, vel.y, -restitution * vel.z)
 
 
+@wp.kernel
+def _warp_apply_floor_collisions_batched(
+    positions: wp.array(dtype=wp.vec3),
+    predicted: wp.array(dtype=wp.vec3),
+    velocities: wp.array(dtype=wp.vec3),
+    min_z_per_rod: wp.array(dtype=wp.float32),
+    particle_rod_id: wp.array(dtype=wp.int32),
+    restitution: float,
+):
+    """Apply floor collision constraints for batched rods (single kernel launch).
+
+    Clamps particles above the floor and reflects velocity with restitution.
+    Each rod can have a different min_z based on its radius.
+
+    Args:
+        positions: Batched positions for all rods (updated in-place).
+        predicted: Batched predicted positions (updated in-place).
+        velocities: Batched velocities (updated in-place).
+        min_z_per_rod: Minimum Z coordinate per rod (floor + rod_radius).
+        particle_rod_id: Rod index for each particle.
+        restitution: Coefficient of restitution.
+    """
+    i = wp.tid()
+    rod_id = particle_rod_id[i]
+    min_z = min_z_per_rod[rod_id]
+    pos = positions[i]
+    if pos.z < min_z:
+        clamped = wp.vec3(pos.x, pos.y, min_z)
+        positions[i] = clamped
+        predicted[i] = clamped
+        vel = velocities[i]
+        if vel.z < 0.0:
+            velocities[i] = wp.vec3(vel.x, vel.y, -restitution * vel.z)
+
+
 # ==============================================================================
 # Root control
 # ==============================================================================
@@ -984,6 +1019,125 @@ def _warp_set_root_on_track_batched(
     velocities[root_idx] = wp.vec3(0.0, 0.0, 0.0)
 
 
+@wp.kernel
+def _warp_set_root_on_track_all_rods(
+    positions: wp.array(dtype=wp.vec3),
+    predicted_positions: wp.array(dtype=wp.vec3),
+    velocities: wp.array(dtype=wp.vec3),
+    rod_offsets: wp.array(dtype=wp.int32),
+    track_starts: wp.array(dtype=wp.vec3),
+    track_ends: wp.array(dtype=wp.vec3),
+    insertions: wp.array(dtype=wp.float32),
+):
+    """Set root positions for all rods in a single kernel launch.
+
+    Each thread handles one rod, setting its root particle position along
+    the track based on the rod's insertion depth.
+
+    Args:
+        positions: Batched positions array (updated in-place).
+        predicted_positions: Batched predicted positions array (updated in-place).
+        velocities: Batched velocities array (updated in-place).
+        rod_offsets: Starting index of each rod's particles in the batched arrays.
+        track_starts: Track start positions for each rod.
+        track_ends: Track end positions for each rod.
+        insertions: Insertion depth for each rod.
+    """
+    rod_id = wp.tid()
+
+    track_start = track_starts[rod_id]
+    track_end = track_ends[rod_id]
+    insertion = insertions[rod_id]
+
+    track_vec = track_end - track_start
+    track_length = wp.length(track_vec)
+
+    if track_length < 1.0e-10:
+        return
+
+    track_dir = track_vec / track_length
+
+    # Clamp insertion to valid range
+    clamped_insertion = wp.clamp(insertion, 0.0, track_length)
+
+    # Compute new root position
+    new_pos = track_start + track_dir * clamped_insertion
+
+    root_idx = rod_offsets[rod_id]
+    positions[root_idx] = new_pos
+    predicted_positions[root_idx] = new_pos
+    velocities[root_idx] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def _warp_apply_track_sliding_all_rods(
+    positions: wp.array(dtype=wp.vec3),
+    predicted_positions: wp.array(dtype=wp.vec3),
+    inv_masses: wp.array(dtype=wp.float32),
+    particle_rod_id: wp.array(dtype=wp.int32),
+    track_starts: wp.array(dtype=wp.vec3),
+    track_ends: wp.array(dtype=wp.vec3),
+    stiffness: float,
+    num_constrained_per_rod: wp.array(dtype=wp.int32),
+    rod_offsets: wp.array(dtype=wp.int32),
+):
+    """Apply track sliding constraint to all particles in a single kernel launch.
+
+    Each thread handles one particle, projecting it onto its rod's track
+    and applying a correction scaled by stiffness.
+
+    Args:
+        positions: Batched positions array (updated in-place).
+        predicted_positions: Batched predicted positions array (updated in-place).
+        inv_masses: Inverse masses for all particles.
+        particle_rod_id: Rod index for each particle.
+        track_starts: Track start positions for each rod.
+        track_ends: Track end positions for each rod.
+        stiffness: Constraint stiffness.
+        num_constrained_per_rod: Number of particles to constrain per rod.
+        rod_offsets: Starting index of each rod's particles.
+    """
+    idx = wp.tid()
+
+    # Skip fixed particles
+    if inv_masses[idx] <= 0.0:
+        return
+
+    rod_id = particle_rod_id[idx]
+    rod_start = rod_offsets[rod_id]
+    local_idx = idx - rod_start
+
+    # Skip if this particle is beyond the constrained count (tip particles)
+    num_constrained = num_constrained_per_rod[rod_id]
+    if local_idx >= num_constrained:
+        return
+
+    # Skip root particle (index 0) - it's handled by set_root_on_track
+    if local_idx == 0:
+        return
+
+    track_start = track_starts[rod_id]
+    track_end = track_ends[rod_id]
+
+    pos = positions[idx]
+    result = _closest_point_on_edge(pos, track_start, track_end)
+    t = result.x
+    dist_sq = result.y
+
+    # Only apply constraint if particle projects to interior of track
+    # and has some distance from the track
+    if t > 0.0 and t < 1.0 and dist_sq > 1.0e-10:
+        # Compute closest point on track
+        edge = track_end - track_start
+        closest = track_start + t * edge
+        # Correction vector from particle to track
+        correction = closest - pos
+        # Apply correction scaled by stiffness
+        new_pos = pos + correction * stiffness
+        positions[idx] = new_pos
+        predicted_positions[idx] = new_pos
+
+
 # ==============================================================================
 # Concentric constraint
 # ==============================================================================
@@ -1629,6 +1783,7 @@ __all__ = [
     "_warp_apply_concentric_constraint_v2",
     "_warp_apply_direct_corrections",
     "_warp_apply_floor_collisions",
+    "_warp_apply_floor_collisions_batched",
     "_warp_apply_root_translation",
     "_warp_apply_root_translation_batched",
     "_warp_apply_track_sliding",

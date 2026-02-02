@@ -344,12 +344,51 @@ class RodState:
     def apply_floor_collisions(self, floor_z: float, restitution: float = 0.0) -> None:
         """Apply floor collision constraints to all rods.
 
+        Uses a single batched kernel launch when batched_arrays is available,
+        otherwise falls back to per-rod kernel launches.
+
         Args:
             floor_z: Z coordinate of the floor plane.
             restitution: Coefficient of restitution for bouncing.
         """
-        for rod in self.rods:
-            rod.apply_floor_collisions(floor_z, restitution)
+        if self.batched_arrays is not None:
+            # Use batched kernel for single launch (much faster than per-rod loops)
+            self._apply_floor_collisions_batched(floor_z, restitution)
+        else:
+            # Fallback to per-rod kernel launches
+            for rod in self.rods:
+                rod.apply_floor_collisions(floor_z, restitution)
+
+    def _apply_floor_collisions_batched(self, floor_z: float, restitution: float) -> None:
+        """Apply floor collisions using batched kernel (single launch for all rods)."""
+        from newton.examples.cosserat_codex.kernels import _warp_apply_floor_collisions_batched
+
+        b = self.batched_arrays
+        if b is None or b.total_points == 0:
+            return
+
+        # Update min_z array if floor_z changed (avoid HtoD transfer when unchanged)
+        if b._floor_min_z_dirty or b._last_floor_z != floor_z:
+            min_z_np = np.array([
+                float(floor_z + rod.rod_radius) for rod in self.rods
+            ], dtype=np.float32)
+            b._floor_min_z_wp.assign(wp.array(min_z_np, dtype=wp.float32, device=b.device))
+            b._floor_min_z_dirty = False
+            b._last_floor_z = floor_z
+
+        wp.launch(
+            _warp_apply_floor_collisions_batched,
+            dim=b.total_points,
+            inputs=[
+                b.positions_wp,
+                b.predicted_positions_wp,
+                b.velocities_wp,
+                b._floor_min_z_wp,
+                b.particle_rod_id_wp,
+                float(restitution),
+            ],
+            device=b.device,
+        )
 
     def set_use_batched_step(self, enabled: bool, device=None) -> bool:
         """Enable or disable batched step execution.
@@ -933,6 +972,11 @@ class BatchedGPUArrays:
         self.young_modulus_wp = wp.zeros(self.n_rods, dtype=wp.float32, device=self.device)
         self.torsion_modulus_wp = wp.zeros(self.n_rods, dtype=wp.float32, device=self.device)
         self.inv_inertia_local_diag_wp = wp.zeros(self.n_rods, dtype=wp.vec3, device=self.device)
+        self.rod_radius_wp = wp.zeros(self.n_rods, dtype=wp.float32, device=self.device)
+        # Cached min_z array for batched floor collisions (floor_z + rod_radius per rod)
+        self._floor_min_z_wp = wp.zeros(self.n_rods, dtype=wp.float32, device=self.device)
+        self._floor_min_z_dirty = True  # Force initial sync when floor params change
+        self._last_floor_z = float("nan")  # Track last floor_z to detect changes
 
         # ====================================================================
         # Offset arrays (on GPU for kernel lookups)
@@ -1107,6 +1151,10 @@ class BatchedGPUArrays:
             self.inv_inertia_local_diag_wp.assign(
                 wp.array(inv_inertia_local_np, dtype=wp.vec3, device=self.device)
             )
+
+            # Sync rod radius for batched floor collisions
+            rod_radius_np = np.array([rod.rod_radius for rod in rods], dtype=np.float32)
+            self.rod_radius_wp.assign(wp.array(rod_radius_np, dtype=wp.float32, device=self.device))
 
             self._params_dirty = False
 

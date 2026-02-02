@@ -142,7 +142,7 @@ class Example:
         self.base_gravity = np.array(args.gravity, dtype=np.float32)
         self.gravity_enabled = False
         self.gravity_scale = 1.0
-        self.floor_collision_enabled = True
+        self.floor_collision_enabled = False
         self.floor_height = 0.0
         self.floor_restitution = 0.0
 
@@ -410,6 +410,11 @@ class Example:
         # Initialize per-rod insertion values (all start at 0)
         self.rod_insertions = [0.0] * len(self.rod_infos)
 
+        # Cache whether there are CPU rods (for optimizing sync operations)
+        self._has_cpu_rods = any(
+            ri.solver_type in (SolverType.NUMPY, SolverType.DLL) for ri in self.rod_infos if ri is not None
+        )
+
         target_last_pos = np.array([-3.283308, -0.50000024, 1.6833224], dtype=np.float32)
         current_last_pos = self.ref_rod.positions[-1, 0:3].astype(np.float32)
         self.mesh_offset = target_last_pos - current_last_pos
@@ -620,6 +625,7 @@ class Example:
         # Pre-allocate GPU arrays for batched sync operations (reduces kernel launch overhead)
         # These are used by _sync_state_from_rods and constraint copy-back when batched_arrays exist
         self._gpu_offsets_wp = None
+        self._zero_offsets_wp = None  # Cached zero offsets for velocity sync (no world offset)
         self._gpu_particle_start_indices_wp = None
         if self.gpu_state is not None and self.gpu_state.batched_arrays is not None:
             # Build offsets array for GPU rods (vec3 per rod)
@@ -627,6 +633,10 @@ class Example:
                 [[o[0], o[1], o[2]] for o in self.gpu_offsets], dtype=np.float32
             )
             self._gpu_offsets_wp = wp.array(gpu_offsets_np, dtype=wp.vec3, device=device)
+
+            # Pre-allocate zero offsets array for velocity sync (avoids per-frame allocation)
+            zero_offsets_np = np.zeros((len(self.gpu_state.rods), 3), dtype=np.float32)
+            self._zero_offsets_wp = wp.array(zero_offsets_np, dtype=wp.vec3, device=device)
 
             # Build particle start indices for mapping global particle index to rod index
             # This is stored in batched_arrays already as particle_rod_id_wp
@@ -745,7 +755,8 @@ class Example:
         ref_offset = wp.vec3(float(self.ref_offset[0]), float(self.ref_offset[1]), float(self.ref_offset[2]))
         zero_offset = wp.vec3(0.0, 0.0, 0.0)
 
-        if sync_ref:
+        # Only sync reference rod if there are CPU rods (avoids GPU→CPU→GPU roundtrip for Warp-only setups)
+        if sync_ref and self._has_cpu_rods:
             ref_positions = self.ref_rod.positions[:, 0:3].astype(np.float32)
             ref_velocities = self.ref_rod.velocities[:, 0:3].astype(np.float32)
             self._ref_positions_wp.assign(wp.array(ref_positions, dtype=wp.vec3, device=self.model.device))
@@ -784,10 +795,7 @@ class Example:
                     device=self.model.device,
                 )
                 # Single kernel launch for all GPU rods - velocities (no offset)
-                # Note: velocities don't need offset, so we use a zeroed offsets array
-                if not hasattr(self, "_zero_offsets_wp") or self._zero_offsets_wp is None:
-                    zero_offsets_np = np.zeros((len(self.gpu_state.rods), 3), dtype=np.float32)
-                    self._zero_offsets_wp = wp.array(zero_offsets_np, dtype=wp.vec3, device=self.model.device)
+                # Note: velocities don't need offset, so we use the pre-allocated zeroed offsets array
                 wp.launch(
                     _warp_copy_with_offset_batched,
                     dim=total_gpu_points,
@@ -2033,6 +2041,7 @@ class Example:
 
         ui.separator()
         ui.text("Collisions")
+        _changed, self.floor_collision_enabled = ui.checkbox("Floor Collision", self.floor_collision_enabled)
         _changed, self.use_gauss_seidel = ui.checkbox("Use Gauss-Seidel", self.use_gauss_seidel)
         _changed, self.use_two_sided = ui.checkbox("Use Two-Sided Collisions", self.use_two_sided)
         ui.separator()
