@@ -24,7 +24,7 @@ from ..geometry import ShapeFlags
 from ..sim import Model, State
 from .warp_raytrace import ClearData, RenderContext, RenderLightType, RenderShapeType
 
-DEFAULT_CLEAR_DATA = ClearData(0xFF666666)
+DEFAULT_CLEAR_DATA = ClearData(clear_color=0xFF666666, clear_albedo=0xFF000000)
 
 
 @wp.kernel(enable_backward=False)
@@ -224,6 +224,7 @@ class SensorTiledCamera:
         depth_image: wp.array(dtype=wp.float32, ndim=3) | None = None,
         shape_index_image: wp.array(dtype=wp.uint32, ndim=3) | None = None,
         normal_image: wp.array(dtype=wp.vec3f, ndim=3) | None = None,
+        albedo_image: wp.array(dtype=wp.uint32, ndim=3) | None = None,
         refit_bvh: bool = True,
         clear_data: ClearData | None = DEFAULT_CLEAR_DATA,
     ):
@@ -242,6 +243,8 @@ class SensorTiledCamera:
                         If None, no shape index rendering is performed.
             normal_image: Optional output array for normal data (num_worlds, num_cameras, width*height).
                         If None, no normal rendering is performed.
+            albedo_image: Optional output array for albedo data (num_worlds, num_cameras, width*height).
+                        If None, no albedo rendering is performed.
             refit_bvh: Whether to refit the BVH or not.
             clear_data: The data to clear the image buffers with (or skip if None).
         """
@@ -255,6 +258,7 @@ class SensorTiledCamera:
             depth_image,
             shape_index_image,
             normal_image,
+            albedo_image,
             refit_bvh=refit_bvh,
             clear_data=clear_data,
         )
@@ -335,6 +339,7 @@ class SensorTiledCamera:
         image: wp.array(dtype=wp.float32, ndim=3),
         out_buffer: wp.array(dtype=wp.uint8, ndim=3) | None = None,
         num_worlds_per_row: int | None = None,
+        depth_range: wp.array(dtype=wp.float32) | None = None,
     ):
         """
         Flatten rendered depth image to a tiled grayscale image buffer.
@@ -347,9 +352,10 @@ class SensorTiledCamera:
             image: Depth output array from render(), shape (num_worlds, num_cameras, width*height).
             out_buffer: Optional output array
             num_worlds_per_row: Optional number of rows
+            depth_range: Depth range to normalize to, shape (2) [near, far], will be automatically determined if None
         """
 
-        return self.render_context.utils.flatten_depth_image_to_rgba(image, out_buffer, num_worlds_per_row)
+        return self.render_context.utils.flatten_depth_image_to_rgba(image, out_buffer, num_worlds_per_row, depth_range)
 
     def assign_random_colors_per_world(self, seed: int = 100):
         """
@@ -429,3 +435,12 @@ class SensorTiledCamera:
             wp.array of shape (num_worlds, num_cameras, width*height) with dtype vec3f.
         """
         return self.render_context.create_normal_image_output()
+
+    def create_albedo_image_output(self):
+        """
+        Create a Warp array for albedo image output.
+
+        Returns:
+            wp.array of shape (num_worlds, num_cameras, width*height) with dtype uint32.
+        """
+        return self.render_context.create_albedo_image_output()
