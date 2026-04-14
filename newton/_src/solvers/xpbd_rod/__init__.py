@@ -23,10 +23,13 @@ solver import path.
 
 from .builder import add_elastic_rod
 from .kernels_visualization import compute_director_lines_kernel
+from .rod_mesher import BatchedRodMesher, RodMesher
 from .solver_xpbd_rod import SolverXPBDRod
 
 __all__ = [
     "SolverXPBDRod",
     "add_elastic_rod",
     "compute_director_lines_kernel",
+    "RodMesher",
+    "BatchedRodMesher",
 ]
