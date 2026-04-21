@@ -32,8 +32,6 @@ import newton.examples
 import newton.solvers
 from newton.solvers import xpbd_rod
 
-from newton.examples.elastic_rod.rod_mesher import BatchedRodMesher
-
 
 class Example:
     def __init__(self, viewer, args=None):
@@ -101,7 +99,7 @@ class Example:
         self.contacts = self.model.contacts()
 
         # Batched rod mesher — single kernel launch for all rods
-        self._mesher = BatchedRodMesher(
+        self._mesher = xpbd_rod.BatchedRodMesher(
             num_rods=self.num_rods,
             num_points=num_points,
             radius=0.01,

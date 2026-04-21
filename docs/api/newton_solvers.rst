@@ -407,10 +407,12 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
    :hidden:
 
    newton_solvers_style3d
+   newton_solvers_xpbd_rod
 
 .. rubric:: Submodules
 
 - :doc:`newton.solvers.style3d <newton_solvers_style3d>`
+- :doc:`newton.solvers.xpbd_rod <newton_solvers_xpbd_rod>`
 
 .. rubric:: Classes
 
@@ -428,3 +430,4 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
    SolverStyle3D
    SolverVBD
    SolverXPBD
+   SolverXPBDRod

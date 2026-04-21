@@ -32,7 +32,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-NUM_POINTS = 256
+NUM_POINTS = 128
 SEGMENT_LENGTH = 0.025
 PARTICLE_MASS = 1.0
 PARTICLE_RADIUS = 0.02
@@ -40,8 +40,8 @@ ROD_MESH_RADIUS = 0.015
 MESH_SCALE = 0.01
 SUBSTEPS = 4
 COLLISION_ITERATIONS = 2
-TIP_NUM_EDGES = 5
-MESH_PRIM_PATH = "/root/A4009/A4007/Xueguan_rudong/Dynamic_vessels/Mesh"
+TIP_NUM_EDGES = 15
+MESH_PRIM_PATH = "/root/airways/airways"
 
 # ---------------------------------------------------------------------------
 # Warp kernels
@@ -150,6 +150,7 @@ class Example:
         self.track_enabled = True
         self.track_stiffness = 1.0
         self.collision_enabled = True
+        self.collision_iterations = COLLISION_ITERATIONS
 
         # Controls
         self.insertion = 0.0
@@ -161,7 +162,7 @@ class Example:
         from pxr import Usd  # noqa: PLC0415
 
         asset_dir = os.path.dirname(os.path.abspath(__file__))
-        usd_path = os.path.join(asset_dir, "DynamicAorta.usdc")
+        usd_path = os.path.join(asset_dir, "airways-mod.usdc")
         stage = Usd.Stage.Open(usd_path)
         prim = stage.GetPrimAtPath(MESH_PRIM_PATH)
         newton_mesh = newton.usd.get_mesh(prim, load_normals=True)
@@ -174,8 +175,8 @@ class Example:
         self.device = wp.get_device()
 
         # Mesh transform (Euler XYZ radians + translation)
-        self.mesh_offset = np.array([9.833, 0.111, 0.503], dtype=np.float32)
-        self.mesh_rotation = np.array([-1.333, 1.369, 0.000], dtype=np.float32)
+        self.mesh_offset = np.array([3.129, -0.000, 1.006], dtype=np.float32)
+        self.mesh_rotation = np.array([1.826, -1.264, -0.070], dtype=np.float32)
 
         # Build initial transformed mesh arrays
         self.aorta_verts_wp = None
@@ -373,6 +374,9 @@ class Example:
         self.solver.track_stiffness = self.track_stiffness
         self.solver.collision_enabled = self.collision_enabled
 
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.solver.collision_iterations = max(1, int(self.collision_iterations))
+
         for _ in range(self.sim_substeps):
             self._apply_root_control()
 
@@ -502,6 +506,13 @@ class Example:
 
         _, self.track_stiffness = imgui.slider_float(
             "Track Stiffness", self.track_stiffness, 0.0, 1.0
+        )
+
+        imgui.separator()
+
+        _, self.sim_substeps = imgui.slider_int("Substeps", self.sim_substeps, 1, 32)
+        _, self.collision_iterations = imgui.slider_int(
+            "Collision Iterations", self.collision_iterations, 1, 16
         )
 
         imgui.separator()

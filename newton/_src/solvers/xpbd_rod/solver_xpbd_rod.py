@@ -450,7 +450,7 @@ class SolverXPBDRod(SolverBase):
             if ws.num_edges == 0:
                 continue
 
-            self._step_rod(ws, dt, device)
+            self._step_rod(rod_idx, ws, dt, device)
 
             # Sync positions back to state_out.particle_q
             ps = self._rod_particle_starts[rod_idx]
@@ -478,7 +478,17 @@ class SolverXPBDRod(SolverBase):
             device=ws.device,
         )
 
-    def _step_rod(self, ws: _RodWorkspace, dt: float, device: wp.Device):
+    def _project_predicted_positions(
+        self,
+        rod_idx: int,
+        ws: _RodWorkspace,
+        dt: float,
+        device: wp.Device,
+    ) -> None:
+        """Private extension point for sample-specific predicted-position projection."""
+        del rod_idx, ws, dt, device
+
+    def _step_rod(self, rod_idx: int, ws: _RodWorkspace, dt: float, device: wp.Device):
         """Run one XPBD step for a single rod."""
         # 1. Predict positions & rotations
         gravity = ws.gravity
@@ -531,7 +541,10 @@ class SolverXPBDRod(SolverBase):
         # 3. Project constraints
         self._project_direct(ws, device)
 
-        # 4. Floor collision (optional)
+        # 4. Private sample hook for additional predicted-position projection.
+        self._project_predicted_positions(rod_idx, ws, dt, device)
+
+        # 5. Floor collision (optional)
         if self.floor_z is not None:
             min_z = float(self.floor_z)
             wp.launch(
@@ -541,7 +554,7 @@ class SolverXPBDRod(SolverBase):
                 device=device,
             )
 
-        # 5. Integrate
+        # 6. Integrate
         wp.launch(
             _warp_integrate_positions,
             dim=ws.num_points,

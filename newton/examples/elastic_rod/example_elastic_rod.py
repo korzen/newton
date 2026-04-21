@@ -31,8 +31,6 @@ import newton.examples
 import newton.solvers
 from newton.solvers import xpbd_rod
 
-from newton.examples.elastic_rod.rod_mesher import RodMesher
-
 
 class Example:
     def __init__(self, viewer, args=None):
@@ -119,7 +117,7 @@ class Example:
         # Create rod meshers for tube visualization
         self._meshers = []
         for ws in self.solver._rods:
-            mesher = RodMesher(
+            mesher = xpbd_rod.RodMesher(
                 num_points=ws.num_points,
                 radius=0.01,
                 resolution=8,
