@@ -120,6 +120,7 @@ class State:
         Clear all force arrays (for particles and bodies) in the state object.
 
         Sets all entries of :attr:`particle_f` and :attr:`body_f` to zero, if present.
+        Also clears XPBD rod torques when the ``xpbd:torque`` state attribute exists.
         """
         with wp.ScopedTimer("clear_forces", False):
             if self.particle_count:
@@ -127,6 +128,10 @@ class State:
 
             if self.body_count:
                 self.body_f.zero_()
+
+            xpbd = getattr(self, "xpbd", None)
+            if xpbd is not None and getattr(xpbd, "torque", None) is not None:
+                xpbd.torque.zero_()
 
     def assign(self, other: State) -> None:
         """

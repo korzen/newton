@@ -29,13 +29,13 @@ from .kernels_math import _block_index, _block_index_3x3, _inv_inertia_mul_vec, 
 
 @wp.kernel
 def _warp_assemble_jmjt_dense(
-    jacobian_pos: wp.array(dtype=wp.float32),
-    jacobian_rot: wp.array(dtype=wp.float32),
-    compliance: wp.array(dtype=wp.float32),
-    inv_masses: wp.array(dtype=wp.float32),
-    inv_inertia: wp.array(dtype=wp.float32),
+    jacobian_pos: wp.array[wp.float32],
+    jacobian_rot: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
+    inv_masses: wp.array[wp.float32],
+    inv_inertia: wp.array[wp.float32],
     n_dofs: int,
-    A: wp.array2d(dtype=wp.float32),
+    A: wp.array2d[wp.float32],
 ):
     """Assemble JMJT dense matrix with proper mass weighting.
 
@@ -152,13 +152,13 @@ def _warp_assemble_jmjt_dense(
 
 @wp.kernel
 def _warp_assemble_jmjt_banded(
-    jacobian_pos: wp.array(dtype=wp.float32),
-    jacobian_rot: wp.array(dtype=wp.float32),
-    compliance: wp.array(dtype=wp.float32),
-    inv_masses: wp.array(dtype=wp.float32),
-    inv_inertia: wp.array(dtype=wp.float32),
+    jacobian_pos: wp.array[wp.float32],
+    jacobian_rot: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
+    inv_masses: wp.array[wp.float32],
+    inv_inertia: wp.array[wp.float32],
     n_dofs: int,
-    ab: wp.array2d(dtype=wp.float32),
+    ab: wp.array2d[wp.float32],
 ):
     """Assemble JMJT banded matrix with proper mass weighting.
 
@@ -280,14 +280,14 @@ def _warp_assemble_jmjt_banded(
 
 @wp.kernel
 def _warp_assemble_jmjt_blocks(
-    jacobian_pos: wp.array(dtype=wp.float32),
-    jacobian_rot: wp.array(dtype=wp.float32),
-    compliance: wp.array(dtype=wp.float32),
-    inv_masses: wp.array(dtype=wp.float32),
-    inv_inertia: wp.array(dtype=wp.float32),
+    jacobian_pos: wp.array[wp.float32],
+    jacobian_rot: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
+    inv_masses: wp.array[wp.float32],
+    inv_inertia: wp.array[wp.float32],
     n_edges: int,
-    diag_blocks: wp.array(dtype=wp.float32),
-    offdiag_blocks: wp.array(dtype=wp.float32),
+    diag_blocks: wp.array[wp.float32],
+    offdiag_blocks: wp.array[wp.float32],
 ):
     """Assemble JMJT blocks with proper mass weighting for block Thomas solver.
 
@@ -400,7 +400,7 @@ def _warp_assemble_jmjt_blocks(
 
 @wp.kernel
 def _warp_pad_diagonal(
-    A: wp.array2d(dtype=wp.float32),
+    A: wp.array2d[wp.float32],
     n_dofs: int,
     tile: int,
 ):
@@ -418,16 +418,16 @@ def _warp_pad_diagonal(
 
 @wp.kernel
 def _warp_assemble_jmjt_blocks_batched(
-    jacobian_pos: wp.array(dtype=wp.float32),
-    jacobian_rot: wp.array(dtype=wp.float32),
-    compliance: wp.array(dtype=wp.float32),
-    inv_masses: wp.array(dtype=wp.float32),
-    inv_inertia: wp.array(dtype=wp.float32),
-    rod_offsets: wp.array(dtype=wp.int32),
-    edge_offsets: wp.array(dtype=wp.int32),
-    edge_rod_id: wp.array(dtype=wp.int32),
-    diag_blocks: wp.array(dtype=wp.float32),
-    offdiag_blocks: wp.array(dtype=wp.float32),
+    jacobian_pos: wp.array[wp.float32],
+    jacobian_rot: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
+    inv_masses: wp.array[wp.float32],
+    inv_inertia: wp.array[wp.float32],
+    rod_offsets: wp.array[wp.int32],
+    edge_offsets: wp.array[wp.int32],
+    edge_rod_id: wp.array[wp.int32],
+    diag_blocks: wp.array[wp.float32],
+    offdiag_blocks: wp.array[wp.float32],
 ):
     """Assemble JMJT blocks for all rods in a single launch.
 
@@ -552,11 +552,11 @@ def _warp_assemble_jmjt_blocks_batched(
 
 @wp.kernel
 def _warp_compute_inv_inertia_world_batched(
-    orientations: wp.array(dtype=wp.quat),
-    quat_inv_masses: wp.array(dtype=wp.float32),
-    inv_inertia_local_diag: wp.array(dtype=wp.vec3),
-    particle_rod_id: wp.array(dtype=wp.int32),
-    inv_inertia_out: wp.array(dtype=wp.float32),
+    orientations: wp.array[wp.quat],
+    quat_inv_masses: wp.array[wp.float32],
+    inv_inertia_local_diag: wp.array[wp.vec3],
+    particle_rod_id: wp.array[wp.int32],
+    inv_inertia_out: wp.array[wp.float32],
 ):
     """Compute inverse inertia tensors for all rods in a single launch.
 
@@ -628,14 +628,14 @@ def _warp_compute_inv_inertia_world_batched(
 
 @wp.kernel
 def _warp_assemble_stretch_blocks(
-    jacobian_pos: wp.array(dtype=wp.float32),
-    jacobian_rot: wp.array(dtype=wp.float32),
-    compliance: wp.array(dtype=wp.float32),
-    inv_masses: wp.array(dtype=wp.float32),
-    inv_inertia: wp.array(dtype=wp.float32),
+    jacobian_pos: wp.array[wp.float32],
+    jacobian_rot: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
+    inv_masses: wp.array[wp.float32],
+    inv_inertia: wp.array[wp.float32],
     n_edges: int,
-    diag_blocks: wp.array(dtype=wp.float32),
-    offdiag_blocks: wp.array(dtype=wp.float32),
+    diag_blocks: wp.array[wp.float32],
+    offdiag_blocks: wp.array[wp.float32],
 ):
     """Assemble 3x3 block-tridiagonal system for stretch constraints.
 
@@ -760,12 +760,12 @@ def _warp_assemble_stretch_blocks(
 
 @wp.kernel
 def _warp_assemble_darboux_blocks(
-    jacobian_rot: wp.array(dtype=wp.float32),
-    compliance: wp.array(dtype=wp.float32),
-    inv_inertia: wp.array(dtype=wp.float32),
+    jacobian_rot: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
+    inv_inertia: wp.array[wp.float32],
     n_edges: int,
-    diag_blocks: wp.array(dtype=wp.float32),
-    offdiag_blocks: wp.array(dtype=wp.float32),
+    diag_blocks: wp.array[wp.float32],
+    offdiag_blocks: wp.array[wp.float32],
 ):
     """Assemble 3x3 block-tridiagonal system for darboux (bend/twist) constraints.
 

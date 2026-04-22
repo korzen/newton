@@ -32,9 +32,8 @@ import warp as wp
 import newton
 import newton.examples
 import newton.solvers
-from newton.solvers import xpbd_rod
-
 from newton.examples.elastic_rod.rod_mesher import BatchedRodMesher
+from newton.solvers import xpbd_rod
 
 
 class Example:
@@ -207,7 +206,9 @@ class Example:
             [0.0 if (self.lock_root[rod_idx] or self.lock_root_rotation[rod_idx]) else free_quat_inv_mass],
             dtype=np.float32,
         )
-        wp.copy(dest=ws.quat_inv_masses_wp, src=wp.array(root_quat_inv_mass, dtype=wp.float32, device=ws.device), count=1)
+        wp.copy(
+            dest=ws.quat_inv_masses_wp, src=wp.array(root_quat_inv_mass, dtype=wp.float32, device=ws.device), count=1
+        )
 
     def _update_rest_lengths(self, rod_idx):
         import warp as wp

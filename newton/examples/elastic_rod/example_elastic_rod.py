@@ -29,9 +29,8 @@ import warp as wp
 import newton
 import newton.examples
 import newton.solvers
-from newton.solvers import xpbd_rod
-
 from newton.examples.elastic_rod.rod_mesher import RodMesher
+from newton.solvers import xpbd_rod
 
 
 class Example:
@@ -98,8 +97,6 @@ class Example:
         self.state_1 = self.model.state()
         self.control = self.model.control()
         self.contacts = self.model.contacts()
-
-
 
         # Director visualization state
         self.show_directors = False
@@ -175,23 +172,15 @@ class Example:
         if dx == 0.0 and dz == 0.0:
             return
 
-        def qmul(a, b):
-            return np.array([
-                a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],
-                a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],
-                a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3],
-                a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2],
-            ], dtype=np.float32)
-
-        qx = np.array([np.sin(dx / 2), 0.0, 0.0, np.cos(dx / 2)], dtype=np.float32)
-        qz = np.array([0.0, 0.0, np.sin(dz / 2), np.cos(dz / 2)], dtype=np.float32)
+        qx = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), float(dx))
+        qz = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(dz))
 
         for rod_idx in range(len(self.solver._rods)):
             q = self._root_qs[rod_idx]
-            q = qmul(qz, qmul(qx, q))
-            q /= np.linalg.norm(q)
-            self._root_qs[rod_idx] = q
-            self.solver.set_root_orientation(rod_idx, wp.quat(float(q[0]), float(q[1]), float(q[2]), float(q[3])))
+            q_wp = wp.quat(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+            q_new = wp.normalize(wp.mul(qz, wp.mul(qx, q_wp)))
+            self._root_qs[rod_idx] = np.array([q_new[0], q_new[1], q_new[2], q_new[3]], dtype=np.float32)
+            self.solver.set_root_orientation(rod_idx, q_new)
 
     def _simulate_substeps(self):
         for _ in range(self.sim_substeps):
@@ -265,7 +254,9 @@ class Example:
         for ws in self.solver._rods:
             ws.young_modulus = self.young_modulus
             ws.torsion_modulus = self.torsion_modulus
-            bs = np.full((ws.num_edges, 3), [self.bend_stiffness, self.bend_stiffness, self.twist_stiffness], dtype=np.float32)
+            bs = np.full(
+                (ws.num_edges, 3), [self.bend_stiffness, self.bend_stiffness, self.twist_stiffness], dtype=np.float32
+            )
             ws.bend_stiffness_wp.assign(wp.array(bs, dtype=wp.vec3, device=ws.bend_stiffness_wp.device))
 
     def _update_root_lock(self):
@@ -278,7 +269,11 @@ class Example:
 
             free_quat_inv_mass = self._free_quat_inv_masses[rod_idx]
             root_quat_inv_mass = np.array([0.0 if self.lock_root_rotation else free_quat_inv_mass], dtype=np.float32)
-            wp.copy(dest=ws.quat_inv_masses_wp, src=wp.array(root_quat_inv_mass, dtype=wp.float32, device=ws.device), count=1)
+            wp.copy(
+                dest=ws.quat_inv_masses_wp,
+                src=wp.array(root_quat_inv_mass, dtype=wp.float32, device=ws.device),
+                count=1,
+            )
 
     def _update_rest_lengths(self):
         import warp as wp

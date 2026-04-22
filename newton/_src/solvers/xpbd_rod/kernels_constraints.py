@@ -33,12 +33,12 @@ from .kernels_math import (
 
 @wp.kernel
 def _warp_prepare_compliance(
-    rest_lengths: wp.array(dtype=wp.float32),
-    bend_stiffness: wp.array(dtype=wp.vec3),
+    rest_lengths: wp.array[wp.float32],
+    bend_stiffness: wp.array[wp.vec3],
     young_modulus: float,
     torsion_modulus: float,
     dt: float,
-    compliance: wp.array(dtype=wp.float32),
+    compliance: wp.array[wp.float32],
 ):
     """Compute compliance values for XPBD constraints.
 
@@ -78,11 +78,11 @@ def _warp_prepare_compliance(
 
 @wp.kernel
 def _warp_update_constraints_direct(
-    positions: wp.array(dtype=wp.vec3),
-    orientations: wp.array(dtype=wp.quat),
-    rest_lengths: wp.array(dtype=wp.float32),
-    rest_darboux: wp.array(dtype=wp.vec3),
-    constraint_values: wp.array(dtype=wp.float32),
+    positions: wp.array[wp.vec3],
+    orientations: wp.array[wp.quat],
+    rest_lengths: wp.array[wp.float32],
+    rest_darboux: wp.array[wp.vec3],
+    constraint_values: wp.array[wp.float32],
 ):
     """Compute constraint values for direct solve.
 
@@ -124,10 +124,10 @@ def _warp_update_constraints_direct(
 
 @wp.kernel
 def _warp_compute_jacobians_direct(
-    orientations: wp.array(dtype=wp.quat),
-    rest_lengths: wp.array(dtype=wp.float32),
-    jacobian_pos: wp.array(dtype=wp.float32),
-    jacobian_rot: wp.array(dtype=wp.float32),
+    orientations: wp.array[wp.quat],
+    rest_lengths: wp.array[wp.float32],
+    jacobian_pos: wp.array[wp.float32],
+    jacobian_rot: wp.array[wp.float32],
 ):
     """Compute Jacobians for direct solve.
 
@@ -229,11 +229,11 @@ def _warp_compute_jacobians_direct(
 
 @wp.kernel
 def _warp_build_rhs(
-    constraint_values: wp.array(dtype=wp.float32),
-    compliance: wp.array(dtype=wp.float32),
-    lambda_sum: wp.array(dtype=wp.float32),
+    constraint_values: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
+    lambda_sum: wp.array[wp.float32],
     n_dofs: int,
-    rhs: wp.array(dtype=wp.float32),
+    rhs: wp.array[wp.float32],
 ):
     """Build the RHS vector for the linear system.
 
@@ -255,13 +255,13 @@ def _warp_build_rhs(
 
 @wp.kernel
 def _warp_prepare_compliance_batched(
-    rest_lengths: wp.array(dtype=wp.float32),
-    bend_stiffness: wp.array(dtype=wp.vec3),
-    edge_rod_id: wp.array(dtype=wp.int32),
-    young_modulus: wp.array(dtype=wp.float32),
-    torsion_modulus: wp.array(dtype=wp.float32),
+    rest_lengths: wp.array[wp.float32],
+    bend_stiffness: wp.array[wp.vec3],
+    edge_rod_id: wp.array[wp.int32],
+    young_modulus: wp.array[wp.float32],
+    torsion_modulus: wp.array[wp.float32],
     dt: float,
-    compliance: wp.array(dtype=wp.float32),
+    compliance: wp.array[wp.float32],
 ):
     """Compute compliance values for all rods in a single launch.
 
@@ -307,14 +307,14 @@ def _warp_prepare_compliance_batched(
 
 @wp.kernel
 def _warp_update_constraints_batched_v2(
-    positions: wp.array(dtype=wp.vec3),
-    orientations: wp.array(dtype=wp.quat),
-    rest_lengths: wp.array(dtype=wp.float32),
-    rest_darboux: wp.array(dtype=wp.vec3),
-    rod_offsets: wp.array(dtype=wp.int32),
-    edge_offsets: wp.array(dtype=wp.int32),
-    edge_rod_id: wp.array(dtype=wp.int32),
-    constraint_values: wp.array(dtype=wp.float32),
+    positions: wp.array[wp.vec3],
+    orientations: wp.array[wp.quat],
+    rest_lengths: wp.array[wp.float32],
+    rest_darboux: wp.array[wp.vec3],
+    rod_offsets: wp.array[wp.int32],
+    edge_offsets: wp.array[wp.int32],
+    edge_rod_id: wp.array[wp.int32],
+    constraint_values: wp.array[wp.float32],
 ):
     """Compute constraint values for all rods in a single launch.
 
@@ -368,13 +368,13 @@ def _warp_update_constraints_batched_v2(
 
 @wp.kernel
 def _warp_compute_jacobians_batched(
-    orientations: wp.array(dtype=wp.quat),
-    rest_lengths: wp.array(dtype=wp.float32),
-    rod_offsets: wp.array(dtype=wp.int32),
-    edge_offsets: wp.array(dtype=wp.int32),
-    edge_rod_id: wp.array(dtype=wp.int32),
-    jacobian_pos: wp.array(dtype=wp.float32),
-    jacobian_rot: wp.array(dtype=wp.float32),
+    orientations: wp.array[wp.quat],
+    rest_lengths: wp.array[wp.float32],
+    rod_offsets: wp.array[wp.int32],
+    edge_offsets: wp.array[wp.int32],
+    edge_rod_id: wp.array[wp.int32],
+    jacobian_pos: wp.array[wp.float32],
+    jacobian_rot: wp.array[wp.float32],
 ):
     """Compute Jacobians for all rods in a single launch.
 
@@ -488,11 +488,11 @@ def _warp_compute_jacobians_batched(
 
 @wp.kernel
 def _warp_build_rhs_stretch(
-    constraint_values: wp.array(dtype=wp.float32),
-    compliance: wp.array(dtype=wp.float32),
-    lambda_sum: wp.array(dtype=wp.float32),
+    constraint_values: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
+    lambda_sum: wp.array[wp.float32],
     n_edges: int,
-    rhs: wp.array(dtype=wp.float32),
+    rhs: wp.array[wp.float32],
 ):
     """Build the RHS vector for stretch constraints only.
 
@@ -517,11 +517,11 @@ def _warp_build_rhs_stretch(
 
 @wp.kernel
 def _warp_build_rhs_darboux(
-    constraint_values: wp.array(dtype=wp.float32),
-    compliance: wp.array(dtype=wp.float32),
-    lambda_sum: wp.array(dtype=wp.float32),
+    constraint_values: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
+    lambda_sum: wp.array[wp.float32],
     n_edges: int,
-    rhs: wp.array(dtype=wp.float32),
+    rhs: wp.array[wp.float32],
 ):
     """Build the RHS vector for darboux constraints only.
 

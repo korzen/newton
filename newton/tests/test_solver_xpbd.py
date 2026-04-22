@@ -793,6 +793,314 @@ def test_xpbd_update_contacts_requires_force_attribute(test, device):
         solver.update_contacts(contacts)
 
 
+def _make_particle_frame_rod_model(
+    device,
+    *,
+    num_points=12,
+    spacing=0.05,
+    height=1.0,
+    particle_mass=0.05,
+    radius=0.02,
+    bend_stiffness=0.1,
+    twist_stiffness=0.1,
+    young_modulus=1.0e4,
+    torsion_modulus=1.0e4,
+    gravity=(0.0, 0.0, -9.81),
+    add_ground=False,
+):
+    builder = newton.ModelBuilder(up_axis="Z")
+    newton.solvers.SolverXPBD.register_custom_attributes(builder)
+
+    positions = np.zeros((num_points, 3), dtype=np.float32)
+    positions[:, 0] = np.arange(num_points, dtype=np.float32) * spacing
+    positions[:, 2] = height
+
+    newton.solvers.xpbd_rod.add_elastic_rod(
+        builder,
+        positions=positions,
+        radius=radius,
+        particle_mass=particle_mass,
+        bend_stiffness=bend_stiffness,
+        twist_stiffness=twist_stiffness,
+        young_modulus=young_modulus,
+        torsion_modulus=torsion_modulus,
+    )
+
+    if add_ground:
+        builder.add_ground_plane()
+
+    model = builder.finalize(device=device)
+    if gravity != (0.0, 0.0, -9.81):
+        model.set_gravity(gravity)
+    return model, positions
+
+
+def _step_particle_frame_rod(model, *, iterations=4, num_steps=200, dt=0.001, rod_solve_method="direct"):
+    solver = newton.solvers.SolverXPBD(model=model, iterations=iterations, rod_solve_method=rod_solve_method)
+    state0 = model.state()
+    state1 = model.state()
+    control = model.control()
+    contacts = model.contacts()
+
+    for _ in range(num_steps):
+        model.collide(state0, contacts)
+        solver.step(state0, state1, control, contacts, dt)
+        state0, state1 = state1, state0
+
+    return solver, state0
+
+
+def _quat_alignment(q0: np.ndarray, q1: np.ndarray) -> float:
+    return float(abs(np.dot(q0, q1)))
+
+
+def test_xpbd_particle_frame_rod_builder_dual_path(test, device):
+    """Builder helper populates both legacy and base-XPBD rod data when both schemas are registered."""
+    builder = newton.ModelBuilder(up_axis="Z")
+    newton.solvers.SolverXPBD.register_custom_attributes(builder)
+    newton.solvers.SolverXPBDRod.register_custom_attributes(builder)
+
+    positions = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [0.1, 0.0, 1.0],
+            [0.2, 0.0, 1.0],
+            [0.3, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    newton.solvers.xpbd_rod.add_elastic_rod(builder, positions=positions)
+    model = builder.finalize(device=device)
+
+    test.assertTrue(hasattr(model, "xpbd"))
+    test.assertTrue(hasattr(model, "xpbd_rod"))
+    test.assertEqual(model.get_custom_frequency_count("xpbd:rod"), 1)
+    test.assertEqual(model.get_custom_frequency_count("xpbd:rod_particle"), positions.shape[0])
+    test.assertEqual(model.get_custom_frequency_count("xpbd:rod_edge"), positions.shape[0] - 1)
+    test.assertEqual(model.xpbd_rod["rod_num_points"], [positions.shape[0]])
+    test.assertEqual(len(model.xpbd_rod["orientations"]), positions.shape[0])
+    test.assertEqual(len(model.xpbd_rod["rest_lengths"]), positions.shape[0] - 1)
+    np.testing.assert_allclose(
+        model.xpbd.orientation.numpy()[0],
+        np.asarray(model.xpbd_rod["orientations"][0], dtype=np.float32),
+        atol=1.0e-6,
+    )
+
+
+def test_xpbd_particle_frame_rod_under_gravity(test, device):
+    """Particle-frame XPBD rod sags under gravity while keeping the root fixed."""
+    model, initial_positions = _make_particle_frame_rod_model(device, num_points=64)
+    _solver, state = _step_particle_frame_rod(model, num_steps=400)
+
+    positions = state.particle_q.numpy()
+    orientations = state.xpbd.orientation.numpy()
+    test.assertFalse(np.any(np.isnan(positions)))
+    test.assertFalse(np.any(np.isnan(orientations)))
+    test.assertLess(positions[-1, 2], initial_positions[-1, 2] - 0.05)
+    test.assertLess(np.linalg.norm(positions[0] - initial_positions[0]), 1.0e-5)
+
+
+def test_xpbd_particle_frame_rod_zero_gravity_rest(test, device):
+    """Particle-frame XPBD rod stays close to its initial rest shape without gravity."""
+    model, initial_positions = _make_particle_frame_rod_model(device, gravity=(0.0, 0.0, 0.0))
+    initial_orientations = model.xpbd.orientation.numpy().copy()
+    _solver, state = _step_particle_frame_rod(model, num_steps=120)
+
+    positions = state.particle_q.numpy()
+    orientations = state.xpbd.orientation.numpy()
+    test.assertLess(float(np.max(np.abs(positions - initial_positions))), 1.0e-3)
+    test.assertGreater(_quat_alignment(orientations[0], initial_orientations[0]), 0.9999)
+
+
+def test_xpbd_particle_frame_rod_multi_rod_independence(test, device):
+    """Multiple particle-frame rods keep their separation and solve independently."""
+    builder = newton.ModelBuilder(up_axis="Z")
+    newton.solvers.SolverXPBD.register_custom_attributes(builder)
+
+    for rod_idx in range(2):
+        positions = np.zeros((10, 3), dtype=np.float32)
+        positions[:, 0] = np.arange(10, dtype=np.float32) * 0.05
+        positions[:, 1] = rod_idx * 0.5
+        positions[:, 2] = 1.0
+        newton.solvers.xpbd_rod.add_elastic_rod(
+            builder,
+            positions=positions,
+            particle_mass=0.05,
+            bend_stiffness=0.1,
+            twist_stiffness=0.1,
+            young_modulus=1.0e4,
+            torsion_modulus=1.0e4,
+        )
+
+    model = builder.finalize(device=device)
+    _solver, state = _step_particle_frame_rod(model, num_steps=200)
+
+    positions = state.particle_q.numpy()
+    test.assertEqual(positions.shape[0], 20)
+    test.assertLess(abs(float(np.mean(positions[:10, 1])) - 0.0), 1.0e-4)
+    test.assertLess(abs(float(np.mean(positions[10:, 1])) - 0.5), 1.0e-4)
+
+
+def test_xpbd_particle_frame_rod_stiffness_response(test, device):
+    """Bending response changes when Young's modulus and bend stiffness change."""
+    soft_model, _ = _make_particle_frame_rod_model(
+        device,
+        num_points=64,
+        young_modulus=1.0e2,
+        torsion_modulus=1.0e2,
+        bend_stiffness=0.0,
+        twist_stiffness=0.0,
+    )
+    stiff_model, _ = _make_particle_frame_rod_model(
+        device,
+        num_points=64,
+        young_modulus=1.0e8,
+        torsion_modulus=1.0e8,
+        bend_stiffness=1.0,
+        twist_stiffness=1.0,
+    )
+
+    _soft_solver, soft_state = _step_particle_frame_rod(soft_model, num_steps=240)
+    _stiff_solver, stiff_state = _step_particle_frame_rod(stiff_model, num_steps=240)
+
+    soft_tip_z = float(soft_state.particle_q.numpy()[-1, 2])
+    stiff_tip_z = float(stiff_state.particle_q.numpy()[-1, 2])
+    test.assertGreater(
+        stiff_tip_z,
+        soft_tip_z + 0.03,
+        msg=f"Expected stiffer rod to sag less, got soft_tip_z={soft_tip_z:.4f}, stiff_tip_z={stiff_tip_z:.4f}",
+    )
+
+
+def test_xpbd_particle_frame_rod_root_lock(test, device):
+    """Root position and material-frame orientation stay locked when requested."""
+    model, initial_positions = _make_particle_frame_rod_model(device)
+    initial_root_orientation = model.xpbd.orientation.numpy()[0].copy()
+    _solver, state = _step_particle_frame_rod(model, num_steps=300)
+
+    positions = state.particle_q.numpy()
+    orientations = state.xpbd.orientation.numpy()
+    test.assertLess(np.linalg.norm(positions[0] - initial_positions[0]), 1.0e-5)
+    test.assertGreater(_quat_alignment(orientations[0], initial_root_orientation), 0.9999)
+
+
+def test_xpbd_particle_frame_rod_ground_collision(test, device):
+    """Particle-frame XPBD rod collides through the existing particle contact path."""
+    radius = 0.03
+    model, initial_positions = _make_particle_frame_rod_model(
+        device,
+        num_points=32,
+        height=0.05,
+        radius=radius,
+        bend_stiffness=0.0,
+        twist_stiffness=0.0,
+        young_modulus=1.0e2,
+        torsion_modulus=1.0e2,
+        add_ground=True,
+    )
+    _solver, state = _step_particle_frame_rod(model, num_steps=300)
+
+    positions = state.particle_q.numpy()
+    test.assertLess(positions[-1, 2], initial_positions[-1, 2] - 0.005)
+    test.assertGreaterEqual(float(np.min(positions[:, 2])), radius - 5.0e-3)
+
+
+# ---------------------------------------------------------------------------
+# Local (per-edge parallel Jacobi) rod solve method tests
+# ---------------------------------------------------------------------------
+
+
+def test_xpbd_particle_frame_rod_local_under_gravity(test, device):
+    """Local rod solve: rod sags under gravity while keeping the root fixed.
+
+    The per-edge Jacobi solver ignores inter-edge tridiagonal coupling, so
+    it converges much slower than the direct Thomas path (~100-200x less sag
+    for the same iteration count).  This test verifies the solver is stable
+    and produces non-zero downward displacement, not that it matches the
+    direct method's convergence.
+    """
+    model, initial_positions = _make_particle_frame_rod_model(device)
+    _solver, state = _step_particle_frame_rod(model, num_steps=600, iterations=32, rod_solve_method="local")
+
+    positions = state.particle_q.numpy()
+    orientations = state.xpbd.orientation.numpy()
+    test.assertFalse(np.any(np.isnan(positions)))
+    test.assertFalse(np.any(np.isnan(orientations)))
+    # The tip must have moved downward (any amount) and the root stays locked.
+    test.assertLess(positions[-1, 2], initial_positions[-1, 2] - 1.0e-5)
+    test.assertLess(np.linalg.norm(positions[0] - initial_positions[0]), 1.0e-5)
+
+
+def test_xpbd_particle_frame_rod_local_zero_gravity_rest(test, device):
+    """Local rod solve: rod stays close to rest shape without gravity."""
+    model, initial_positions = _make_particle_frame_rod_model(device, gravity=(0.0, 0.0, 0.0))
+    initial_orientations = model.xpbd.orientation.numpy().copy()
+    _solver, state = _step_particle_frame_rod(model, num_steps=120, iterations=32, rod_solve_method="local")
+
+    positions = state.particle_q.numpy()
+    orientations = state.xpbd.orientation.numpy()
+    test.assertLess(float(np.max(np.abs(positions - initial_positions))), 1.0e-3)
+    test.assertGreater(_quat_alignment(orientations[0], initial_orientations[0]), 0.9999)
+
+
+def test_xpbd_particle_frame_rod_local_multi_rod_independence(test, device):
+    """Local rod solve: multiple rods keep their separation."""
+    builder = newton.ModelBuilder(up_axis="Z")
+    newton.solvers.SolverXPBD.register_custom_attributes(builder)
+
+    for rod_idx in range(2):
+        positions = np.zeros((10, 3), dtype=np.float32)
+        positions[:, 0] = np.arange(10, dtype=np.float32) * 0.05
+        positions[:, 1] = rod_idx * 0.5
+        positions[:, 2] = 1.0
+        newton.solvers.xpbd_rod.add_elastic_rod(
+            builder,
+            positions=positions,
+            particle_mass=0.05,
+            bend_stiffness=0.1,
+            twist_stiffness=0.1,
+            young_modulus=1.0e4,
+            torsion_modulus=1.0e4,
+        )
+
+    model = builder.finalize(device=device)
+    _solver, state = _step_particle_frame_rod(model, num_steps=200, iterations=32, rod_solve_method="local")
+
+    positions = state.particle_q.numpy()
+    test.assertEqual(positions.shape[0], 20)
+    test.assertLess(abs(float(np.mean(positions[:10, 1])) - 0.0), 1.0e-4)
+    test.assertLess(abs(float(np.mean(positions[10:, 1])) - 0.5), 1.0e-4)
+
+
+def test_xpbd_particle_frame_rod_local_root_lock(test, device):
+    """Local rod solve: root position and orientation stay locked."""
+    model, initial_positions = _make_particle_frame_rod_model(device)
+    initial_root_orientation = model.xpbd.orientation.numpy()[0].copy()
+    _solver, state = _step_particle_frame_rod(model, num_steps=300, iterations=32, rod_solve_method="local")
+
+    positions = state.particle_q.numpy()
+    orientations = state.xpbd.orientation.numpy()
+    test.assertLess(np.linalg.norm(positions[0] - initial_positions[0]), 1.0e-5)
+    test.assertGreater(_quat_alignment(orientations[0], initial_root_orientation), 0.9999)
+
+
+def test_xpbd_particle_frame_rod_local_ground_collision(test, device):
+    """Local rod solve: rod collides through existing particle contact path."""
+    radius = 0.03
+    model, initial_positions = _make_particle_frame_rod_model(
+        device,
+        height=0.35,
+        radius=radius,
+        add_ground=True,
+    )
+    _solver, state = _step_particle_frame_rod(model, num_steps=600, iterations=32, rod_solve_method="local")
+
+    positions = state.particle_q.numpy()
+    test.assertLess(positions[-1, 2], initial_positions[-1, 2] - 0.02)
+    test.assertGreaterEqual(float(np.min(positions[:, 2])), radius - 5.0e-3)
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -894,6 +1202,102 @@ add_function_test(
     TestSolverXPBD,
     "test_xpbd_update_contacts_requires_force_attribute",
     test_xpbd_update_contacts_requires_force_attribute,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_builder_dual_path",
+    test_xpbd_particle_frame_rod_builder_dual_path,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_under_gravity",
+    test_xpbd_particle_frame_rod_under_gravity,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_zero_gravity_rest",
+    test_xpbd_particle_frame_rod_zero_gravity_rest,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_multi_rod_independence",
+    test_xpbd_particle_frame_rod_multi_rod_independence,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_stiffness_response",
+    test_xpbd_particle_frame_rod_stiffness_response,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_root_lock",
+    test_xpbd_particle_frame_rod_root_lock,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_ground_collision",
+    test_xpbd_particle_frame_rod_ground_collision,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_local_under_gravity",
+    test_xpbd_particle_frame_rod_local_under_gravity,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_local_zero_gravity_rest",
+    test_xpbd_particle_frame_rod_local_zero_gravity_rest,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_local_multi_rod_independence",
+    test_xpbd_particle_frame_rod_local_multi_rod_independence,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_local_root_lock",
+    test_xpbd_particle_frame_rod_local_root_lock,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_xpbd_particle_frame_rod_local_ground_collision",
+    test_xpbd_particle_frame_rod_local_ground_collision,
     devices=devices,
     check_output=False,
 )

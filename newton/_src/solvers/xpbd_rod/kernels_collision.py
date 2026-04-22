@@ -27,14 +27,14 @@ from .kernels_math import _inv_inertia_mul_vec, _warp_jacobian_index, _warp_quat
 
 
 @wp.kernel
-def _warp_zero_float(arr: wp.array(dtype=wp.float32)):
+def _warp_zero_float(arr: wp.array[wp.float32]):
     """Zero out a float array."""
     tid = wp.tid()
     arr[tid] = 0.0
 
 
 @wp.kernel
-def _warp_zero_2d(arr: wp.array2d(dtype=wp.float32), rows: int, cols: int):
+def _warp_zero_2d(arr: wp.array2d[wp.float32], rows: int, cols: int):
     """Zero out a 2D float array."""
     tid = wp.tid()
     if tid < rows * cols:
@@ -44,7 +44,7 @@ def _warp_zero_2d(arr: wp.array2d(dtype=wp.float32), rows: int, cols: int):
 
 
 @wp.kernel
-def _warp_zero_vec3(arr: wp.array(dtype=wp.vec3)):
+def _warp_zero_vec3(arr: wp.array[wp.vec3]):
     """Zero out a vec3 array."""
     tid = wp.tid()
     arr[tid] = wp.vec3(0.0, 0.0, 0.0)
@@ -57,8 +57,8 @@ def _warp_zero_vec3(arr: wp.array(dtype=wp.vec3)):
 
 @wp.kernel
 def _warp_apply_floor_collisions(
-    predicted: wp.array(dtype=wp.vec3),
-    velocities: wp.array(dtype=wp.vec3),
+    predicted: wp.array[wp.vec3],
+    velocities: wp.array[wp.vec3],
     min_z: float,
     restitution: float,
 ):
@@ -80,9 +80,9 @@ def _warp_apply_floor_collisions(
 
 @wp.kernel
 def _warp_set_root_orientation(
-    orientations: wp.array(dtype=wp.quat),
-    predicted: wp.array(dtype=wp.quat),
-    prev: wp.array(dtype=wp.quat),
+    orientations: wp.array[wp.quat],
+    predicted: wp.array[wp.quat],
+    prev: wp.array[wp.quat],
     q: wp.quat,
 ):
     """Set the root particle orientation."""
@@ -101,10 +101,10 @@ def _warp_set_root_orientation(
 
 @wp.kernel
 def _warp_compute_inv_inertia_world(
-    orientations: wp.array(dtype=wp.quat),
-    quat_inv_masses: wp.array(dtype=wp.float32),
+    orientations: wp.array[wp.quat],
+    quat_inv_masses: wp.array[wp.float32],
     inv_inertia_local_diag: wp.vec3,
-    inv_inertia_out: wp.array(dtype=wp.float32),
+    inv_inertia_out: wp.array[wp.float32],
 ):
     """Compute inverse inertia tensor in world frame from local frame diagonal."""
     i = wp.tid()
@@ -177,7 +177,7 @@ def _warp_quat_correction_g(q: wp.quat, dtheta: wp.vec3) -> wp.quat:
 
 @wp.func
 def _warp_jacobian_dot(
-    jacobian: wp.array(dtype=wp.float32),
+    jacobian: wp.array[wp.float32],
     edge: int,
     col: int,
     dl0: float,
@@ -205,19 +205,19 @@ def _warp_jacobian_dot(
 
 @wp.kernel
 def _warp_compute_corrections_parallel(
-    predicted_positions: wp.array(dtype=wp.vec3),
-    inv_masses: wp.array(dtype=wp.float32),
-    quat_inv_masses: wp.array(dtype=wp.float32),
-    inv_inertia: wp.array(dtype=wp.float32),
-    jacobian_pos: wp.array(dtype=wp.float32),
-    jacobian_rot: wp.array(dtype=wp.float32),
-    delta_lambda: wp.array(dtype=wp.float32),
-    lambda_sum: wp.array(dtype=wp.float32),
+    predicted_positions: wp.array[wp.vec3],
+    inv_masses: wp.array[wp.float32],
+    quat_inv_masses: wp.array[wp.float32],
+    inv_inertia: wp.array[wp.float32],
+    jacobian_pos: wp.array[wp.float32],
+    jacobian_rot: wp.array[wp.float32],
+    delta_lambda: wp.array[wp.float32],
+    lambda_sum: wp.array[wp.float32],
     n_edges: int,
-    pos_corrections: wp.array(dtype=wp.vec3),
-    rot_corrections: wp.array(dtype=wp.vec3),
-    max_delta_out: wp.array(dtype=wp.float32),
-    max_corr_out: wp.array(dtype=wp.float32),
+    pos_corrections: wp.array[wp.vec3],
+    rot_corrections: wp.array[wp.vec3],
+    max_delta_out: wp.array[wp.float32],
+    max_corr_out: wp.array[wp.float32],
 ):
     """Compute position and rotation corrections per edge (parallel phase 1)."""
     edge = wp.tid()
@@ -283,21 +283,21 @@ def _warp_compute_corrections_parallel(
 
 @wp.kernel
 def _warp_compute_corrections_parallel_batched(
-    predicted_positions: wp.array(dtype=wp.vec3),
-    inv_masses: wp.array(dtype=wp.float32),
-    quat_inv_masses: wp.array(dtype=wp.float32),
-    inv_inertia: wp.array(dtype=wp.float32),
-    jacobian_pos: wp.array(dtype=wp.float32),
-    jacobian_rot: wp.array(dtype=wp.float32),
-    delta_lambda: wp.array(dtype=wp.float32),
-    lambda_sum: wp.array(dtype=wp.float32),
-    rod_offsets: wp.array(dtype=wp.int32),
-    edge_offsets: wp.array(dtype=wp.int32),
-    edge_rod_id: wp.array(dtype=wp.int32),
-    pos_corrections: wp.array(dtype=wp.vec3),
-    rot_corrections: wp.array(dtype=wp.vec3),
-    max_delta_out: wp.array(dtype=wp.float32),
-    max_corr_out: wp.array(dtype=wp.float32),
+    predicted_positions: wp.array[wp.vec3],
+    inv_masses: wp.array[wp.float32],
+    quat_inv_masses: wp.array[wp.float32],
+    inv_inertia: wp.array[wp.float32],
+    jacobian_pos: wp.array[wp.float32],
+    jacobian_rot: wp.array[wp.float32],
+    delta_lambda: wp.array[wp.float32],
+    lambda_sum: wp.array[wp.float32],
+    rod_offsets: wp.array[wp.int32],
+    edge_offsets: wp.array[wp.int32],
+    edge_rod_id: wp.array[wp.int32],
+    pos_corrections: wp.array[wp.vec3],
+    rot_corrections: wp.array[wp.vec3],
+    max_delta_out: wp.array[wp.float32],
+    max_corr_out: wp.array[wp.float32],
 ):
     """Compute position and rotation corrections for all rods in a single launch.
 
@@ -369,10 +369,10 @@ def _warp_compute_corrections_parallel_batched(
 
 @wp.kernel
 def _warp_apply_accumulated_corrections(
-    predicted_positions: wp.array(dtype=wp.vec3),
-    predicted_orientations: wp.array(dtype=wp.quat),
-    pos_corrections: wp.array(dtype=wp.vec3),
-    rot_corrections: wp.array(dtype=wp.vec3),
+    predicted_positions: wp.array[wp.vec3],
+    predicted_orientations: wp.array[wp.quat],
+    pos_corrections: wp.array[wp.vec3],
+    rot_corrections: wp.array[wp.vec3],
     n_particles: int,
 ):
     """Apply accumulated corrections (parallel phase 2)."""
@@ -387,9 +387,9 @@ def _warp_apply_accumulated_corrections(
 
 @wp.kernel
 def _warp_merge_delta_lambda(
-    stretch_dl: wp.array(dtype=wp.float32),
-    darboux_dl: wp.array(dtype=wp.float32),
-    combined_dl: wp.array(dtype=wp.float32),
+    stretch_dl: wp.array[wp.float32],
+    darboux_dl: wp.array[wp.float32],
+    combined_dl: wp.array[wp.float32],
     n_edges: int,
 ):
     """Merge split delta_lambda arrays into combined 6-vector format."""

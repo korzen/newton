@@ -208,7 +208,7 @@ def _block_index_3x3(block: int, row: int, col: int) -> int:
 
 
 @wp.func
-def _load_block_3x3(blocks: wp.array(dtype=wp.float32), block: int) -> wp.mat33:
+def _load_block_3x3(blocks: wp.array[wp.float32], block: int) -> wp.mat33:
     """Load a 3x3 block from flat storage."""
     base = block * 9
     return wp.mat33(
@@ -225,14 +225,14 @@ def _load_block_3x3(blocks: wp.array(dtype=wp.float32), block: int) -> wp.mat33:
 
 
 @wp.func
-def _load_vec3_block(values: wp.array(dtype=wp.float32), block: int) -> wp.vec3:
+def _load_vec3_block(values: wp.array[wp.float32], block: int) -> wp.vec3:
     """Load a 3-vector from block storage."""
     base = block * 3
     return wp.vec3(values[base], values[base + 1], values[base + 2])
 
 
 @wp.func
-def _store_vec3_block(values: wp.array(dtype=wp.float32), block: int, v: wp.vec3):
+def _store_vec3_block(values: wp.array[wp.float32], block: int, v: wp.vec3):
     """Store a 3-vector to block storage."""
     base = block * 3
     values[base] = v[0]
@@ -241,7 +241,7 @@ def _store_vec3_block(values: wp.array(dtype=wp.float32), block: int, v: wp.vec3
 
 
 @wp.func
-def _block_column_3x3(blocks: wp.array(dtype=wp.float32), block: int, col: int) -> wp.vec3:
+def _block_column_3x3(blocks: wp.array[wp.float32], block: int, col: int) -> wp.vec3:
     """Load a column from a 3x3 block as a 3-vector."""
     base = block * 9
     return wp.vec3(
@@ -252,7 +252,7 @@ def _block_column_3x3(blocks: wp.array(dtype=wp.float32), block: int, col: int) 
 
 
 @wp.func
-def _block_set_column_3x3(blocks: wp.array(dtype=wp.float32), block: int, col: int, v: wp.vec3):
+def _block_set_column_3x3(blocks: wp.array[wp.float32], block: int, col: int, v: wp.vec3):
     """Store a 3-vector as a column in a 3x3 block."""
     base = block * 9
     blocks[base + 0 * 3 + col] = v[0]
@@ -266,7 +266,7 @@ def _block_set_column_3x3(blocks: wp.array(dtype=wp.float32), block: int, col: i
 
 
 @wp.func
-def _inv_inertia_mul_vec(inv_inertia: wp.array(dtype=wp.float32), particle_idx: int, v: wp.vec3) -> wp.vec3:
+def _inv_inertia_mul_vec(inv_inertia: wp.array[wp.float32], particle_idx: int, v: wp.vec3) -> wp.vec3:
     """Multiply inverse inertia tensor (3x3) by a vector."""
     base = particle_idx * 9
     return wp.vec3(
@@ -288,7 +288,7 @@ def _block_index(block: int, row: int, col: int) -> int:
 
 
 @wp.func
-def _load_block(blocks: wp.array(dtype=wp.float32), block: int) -> tuple[wp.mat33, wp.mat33, wp.mat33, wp.mat33]:
+def _load_block(blocks: wp.array[wp.float32], block: int) -> tuple[wp.mat33, wp.mat33, wp.mat33, wp.mat33]:
     """Load a 6x6 block as four 3x3 matrices."""
     base = block * 36
     A = wp.mat33(
@@ -340,14 +340,14 @@ def _load_block(blocks: wp.array(dtype=wp.float32), block: int) -> tuple[wp.mat3
 
 @wp.func
 def _load_block_offset(
-    blocks: wp.array(dtype=wp.float32), edge_offset: int, local_block: int
+    blocks: wp.array[wp.float32], edge_offset: int, local_block: int
 ) -> tuple[wp.mat33, wp.mat33, wp.mat33, wp.mat33]:
     """Load a 6x6 block with global offset for batched operations."""
     return _load_block(blocks, edge_offset + local_block)
 
 
 @wp.func
-def _load_vec(values: wp.array(dtype=wp.float32), block: int) -> tuple[wp.vec3, wp.vec3]:
+def _load_vec(values: wp.array[wp.float32], block: int) -> tuple[wp.vec3, wp.vec3]:
     """Load a 6-vector as two 3-vectors."""
     base = block * 6
     v0 = wp.vec3(values[base + 0], values[base + 1], values[base + 2])
@@ -356,13 +356,13 @@ def _load_vec(values: wp.array(dtype=wp.float32), block: int) -> tuple[wp.vec3, 
 
 
 @wp.func
-def _load_vec_offset(values: wp.array(dtype=wp.float32), edge_offset: int, local_block: int) -> tuple[wp.vec3, wp.vec3]:
+def _load_vec_offset(values: wp.array[wp.float32], edge_offset: int, local_block: int) -> tuple[wp.vec3, wp.vec3]:
     """Load a 6-vector with global offset for batched operations."""
     return _load_vec(values, edge_offset + local_block)
 
 
 @wp.func
-def _store_vec(values: wp.array(dtype=wp.float32), block: int, v0: wp.vec3, v1: wp.vec3):
+def _store_vec(values: wp.array[wp.float32], block: int, v0: wp.vec3, v1: wp.vec3):
     """Store two 3-vectors as a 6-vector."""
     base = block * 6
     values[base + 0] = v0[0]
@@ -375,7 +375,7 @@ def _store_vec(values: wp.array(dtype=wp.float32), block: int, v0: wp.vec3, v1: 
 
 @wp.func
 def _store_vec_offset(
-    values: wp.array(dtype=wp.float32),
+    values: wp.array[wp.float32],
     edge_offset: int,
     local_block: int,
     v0: wp.vec3,
@@ -386,7 +386,7 @@ def _store_vec_offset(
 
 
 @wp.func
-def _block_column(blocks: wp.array(dtype=wp.float32), block: int, col: int) -> tuple[wp.vec3, wp.vec3]:
+def _block_column(blocks: wp.array[wp.float32], block: int, col: int) -> tuple[wp.vec3, wp.vec3]:
     """Load a column from a 6x6 block as two 3-vectors."""
     base = block * 36
     v0 = wp.vec3(blocks[base + 0 * 6 + col], blocks[base + 1 * 6 + col], blocks[base + 2 * 6 + col])
@@ -396,14 +396,14 @@ def _block_column(blocks: wp.array(dtype=wp.float32), block: int, col: int) -> t
 
 @wp.func
 def _block_column_offset(
-    blocks: wp.array(dtype=wp.float32), edge_offset: int, local_block: int, col: int
+    blocks: wp.array[wp.float32], edge_offset: int, local_block: int, col: int
 ) -> tuple[wp.vec3, wp.vec3]:
     """Load a column from a 6x6 block with global offset."""
     return _block_column(blocks, edge_offset + local_block, col)
 
 
 @wp.func
-def _block_set_column(blocks: wp.array(dtype=wp.float32), block: int, col: int, v0: wp.vec3, v1: wp.vec3):
+def _block_set_column(blocks: wp.array[wp.float32], block: int, col: int, v0: wp.vec3, v1: wp.vec3):
     """Store two 3-vectors as a column in a 6x6 block."""
     base = block * 36
     blocks[base + 0 * 6 + col] = v0[0]
@@ -416,7 +416,7 @@ def _block_set_column(blocks: wp.array(dtype=wp.float32), block: int, col: int, 
 
 @wp.func
 def _block_set_column_offset(
-    blocks: wp.array(dtype=wp.float32),
+    blocks: wp.array[wp.float32],
     edge_offset: int,
     local_block: int,
     col: int,

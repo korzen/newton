@@ -4,7 +4,7 @@
 import warp as wp
 
 from ...core.types import override
-from ...sim import Contacts, Control, Model, State
+from ...sim import Contacts, Control, Model, ModelBuilder, State
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
 from .kernels import (
@@ -27,6 +27,7 @@ from .kernels import (
     solve_tetrahedra,
     update_body_velocities,
 )
+from .rod import _XPBDRodProjector
 
 
 class SolverXPBD(SolverBase):
@@ -91,6 +92,7 @@ class SolverXPBD(SolverBase):
         rigid_contact_con_weighting: bool = True,
         angular_damping: float = 0.0,
         enable_restitution: bool = False,
+        rod_solve_method: str = "direct",
     ):
         super().__init__(model=model)
         self.iterations = iterations
@@ -113,6 +115,7 @@ class SolverXPBD(SolverBase):
         self.compute_body_velocity_from_position_delta = False
 
         self._init_kinematic_state()
+        self._rod_projector = _XPBDRodProjector.from_model(model, solve_method=rod_solve_method)
 
         # helper variables to track constraint resolution vars
         self._particle_delta_counter = 0
@@ -122,6 +125,145 @@ class SolverXPBD(SolverBase):
             # reserve space for the particle hash grid
             with wp.ScopedDevice(model.device):
                 model.particle_grid.reserve(model.particle_count)
+
+    @classmethod
+    def register_custom_attributes(cls, builder: ModelBuilder) -> None:
+        """Register custom attributes required for particle-frame XPBD rods."""
+        builder.add_custom_frequency(ModelBuilder.CustomFrequency(name="rod", namespace="xpbd"))
+        builder.add_custom_frequency(ModelBuilder.CustomFrequency(name="rod_particle", namespace="xpbd"))
+        builder.add_custom_frequency(ModelBuilder.CustomFrequency(name="rod_edge", namespace="xpbd"))
+
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="particle_start",
+                dtype=wp.int32,
+                frequency="xpbd:rod",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+                references="xpbd:rod_particle",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="particle_count",
+                dtype=wp.int32,
+                frequency="xpbd:rod",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="edge_start",
+                dtype=wp.int32,
+                frequency="xpbd:rod",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+                references="xpbd:rod_edge",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="edge_count",
+                dtype=wp.int32,
+                frequency="xpbd:rod",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="young_modulus",
+                dtype=wp.float32,
+                frequency="xpbd:rod",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="torsion_modulus",
+                dtype=wp.float32,
+                frequency="xpbd:rod",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+            )
+        )
+
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="particle_index",
+                dtype=wp.int32,
+                frequency="xpbd:rod_particle",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+                references="particle",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="quat_inv_mass",
+                dtype=wp.float32,
+                frequency="xpbd:rod_particle",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="orientation",
+                dtype=wp.quat,
+                frequency="xpbd:rod_particle",
+                assignment=Model.AttributeAssignment.STATE,
+                namespace="xpbd",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="angular_velocity",
+                dtype=wp.vec3,
+                frequency="xpbd:rod_particle",
+                assignment=Model.AttributeAssignment.STATE,
+                namespace="xpbd",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="torque",
+                dtype=wp.vec3,
+                frequency="xpbd:rod_particle",
+                assignment=Model.AttributeAssignment.STATE,
+                namespace="xpbd",
+            )
+        )
+
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rest_length",
+                dtype=wp.float32,
+                frequency="xpbd:rod_edge",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rest_darboux",
+                dtype=wp.vec3,
+                frequency="xpbd:rod_edge",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="bend_stiffness",
+                dtype=wp.vec3,
+                frequency="xpbd:rod_edge",
+                assignment=Model.AttributeAssignment.MODEL,
+                namespace="xpbd",
+            )
+        )
 
     @override
     def notify_model_changed(self, flags: int) -> None:
@@ -347,6 +489,9 @@ class SolverXPBD(SolverBase):
             if model.edge_count:
                 edge_constraint_lambdas = wp.empty_like(model.edge_rest_angle)
 
+            if self._rod_projector is not None:
+                self._rod_projector.begin_step(state_in, dt, self.angular_damping)
+
             for i in range(self.iterations):
                 with wp.ScopedTimer(f"iteration_{i}", False):
                     if model.body_count:
@@ -484,6 +629,16 @@ class SolverXPBD(SolverBase):
                             model, state_in, state_out, particle_deltas, dt
                         )
 
+                        if self._rod_projector is not None:
+                            self._rod_projector.project(
+                                particle_q=particle_q,
+                                particle_qd=particle_qd,
+                                particle_q_init=self.particle_q_init,
+                                particle_flags=model.particle_flags,
+                                dt=dt,
+                                particle_max_velocity=model.particle_max_velocity,
+                            )
+
                     # handle rigid bodies
                     # ----------------------------
 
@@ -611,6 +766,9 @@ class SolverXPBD(SolverBase):
             self._contact_impulse = contact_impulse
             self._contact_impulse_capacity = contacts.rigid_contact_max if contacts is not None else 0
             self._last_dt = dt
+
+            if self._rod_projector is not None:
+                self._rod_projector.finalize_step(state_out, dt)
 
             if model.particle_count:
                 if particle_q.ptr != state_out.particle_q.ptr:

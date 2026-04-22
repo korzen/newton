@@ -30,9 +30,8 @@ import warp as wp
 import newton
 import newton.examples
 import newton.solvers
-from newton.solvers import xpbd_rod
-
 from newton.examples.elastic_rod.rod_mesher import BatchedRodMesher
+from newton.solvers import xpbd_rod
 
 
 class Example:

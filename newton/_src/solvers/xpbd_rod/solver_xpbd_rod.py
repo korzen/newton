@@ -258,11 +258,19 @@ class _BatchedRodWorkspace:
             ne = ws.num_edges
 
             wp.copy(dest=self.positions, src=ws.positions_wp, dest_offset=po, src_offset=0, count=np_)
-            wp.copy(dest=self.predicted_positions, src=ws.predicted_positions_wp, dest_offset=po, src_offset=0, count=np_)
+            wp.copy(
+                dest=self.predicted_positions, src=ws.predicted_positions_wp, dest_offset=po, src_offset=0, count=np_
+            )
             wp.copy(dest=self.velocities, src=ws.velocities_wp, dest_offset=po, src_offset=0, count=np_)
             wp.copy(dest=self.forces, src=ws.forces_wp, dest_offset=po, src_offset=0, count=np_)
             wp.copy(dest=self.orientations, src=ws.orientations_wp, dest_offset=po, src_offset=0, count=np_)
-            wp.copy(dest=self.predicted_orientations, src=ws.predicted_orientations_wp, dest_offset=po, src_offset=0, count=np_)
+            wp.copy(
+                dest=self.predicted_orientations,
+                src=ws.predicted_orientations_wp,
+                dest_offset=po,
+                src_offset=0,
+                count=np_,
+            )
             wp.copy(dest=self.prev_orientations, src=ws.prev_orientations_wp, dest_offset=po, src_offset=0, count=np_)
             wp.copy(dest=self.angular_velocities, src=ws.angular_velocities_wp, dest_offset=po, src_offset=0, count=np_)
             wp.copy(dest=self.torques, src=ws.torques_wp, dest_offset=po, src_offset=0, count=np_)
@@ -306,10 +314,7 @@ class SolverXPBDRod(SolverBase):
     ):
         super().__init__(model)
         if solver_backend not in DIRECT_SOLVE_BACKENDS:
-            raise ValueError(
-                f"Unknown solver backend {solver_backend!r}. "
-                f"Expected one of {DIRECT_SOLVE_BACKENDS}"
-            )
+            raise ValueError(f"Unknown solver backend {solver_backend!r}. Expected one of {DIRECT_SOLVE_BACKENDS}")
 
         self.linear_damping = linear_damping
         self.angular_damping = angular_damping

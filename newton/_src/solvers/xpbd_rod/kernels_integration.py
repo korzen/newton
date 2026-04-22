@@ -28,14 +28,14 @@ from .kernels_math import _warp_quat_conjugate, _warp_quat_mul, _warp_quat_norma
 
 @wp.kernel
 def _warp_predict_positions(
-    positions: wp.array(dtype=wp.vec3),
-    velocities: wp.array(dtype=wp.vec3),
-    forces: wp.array(dtype=wp.vec3),
-    inv_masses: wp.array(dtype=wp.float32),
+    positions: wp.array[wp.vec3],
+    velocities: wp.array[wp.vec3],
+    forces: wp.array[wp.vec3],
+    inv_masses: wp.array[wp.float32],
     gravity: wp.vec3,
     dt: float,
     damping: float,
-    predicted: wp.array(dtype=wp.vec3),
+    predicted: wp.array[wp.vec3],
 ):
     """Predict particle positions for constraint projection.
 
@@ -66,10 +66,10 @@ def _warp_predict_positions(
 
 @wp.kernel
 def _warp_integrate_positions(
-    positions: wp.array(dtype=wp.vec3),
-    predicted: wp.array(dtype=wp.vec3),
-    velocities: wp.array(dtype=wp.vec3),
-    inv_masses: wp.array(dtype=wp.float32),
+    positions: wp.array[wp.vec3],
+    predicted: wp.array[wp.vec3],
+    velocities: wp.array[wp.vec3],
+    inv_masses: wp.array[wp.float32],
     dt: float,
 ):
     """Integrate positions after constraint projection.
@@ -93,13 +93,13 @@ def _warp_integrate_positions(
 
 @wp.kernel
 def _warp_predict_rotations(
-    orientations: wp.array(dtype=wp.quat),
-    angular_velocities: wp.array(dtype=wp.vec3),
-    torques: wp.array(dtype=wp.vec3),
-    quat_inv_masses: wp.array(dtype=wp.float32),
+    orientations: wp.array[wp.quat],
+    angular_velocities: wp.array[wp.vec3],
+    torques: wp.array[wp.vec3],
+    quat_inv_masses: wp.array[wp.float32],
     dt: float,
     damping: float,
-    predicted: wp.array(dtype=wp.quat),
+    predicted: wp.array[wp.quat],
 ):
     """Predict particle orientations for constraint projection.
 
@@ -139,11 +139,11 @@ def _warp_predict_rotations(
 
 @wp.kernel
 def _warp_integrate_rotations(
-    orientations: wp.array(dtype=wp.quat),
-    predicted: wp.array(dtype=wp.quat),
-    prev_orientations: wp.array(dtype=wp.quat),
-    angular_velocities: wp.array(dtype=wp.vec3),
-    quat_inv_masses: wp.array(dtype=wp.float32),
+    orientations: wp.array[wp.quat],
+    predicted: wp.array[wp.quat],
+    prev_orientations: wp.array[wp.quat],
+    angular_velocities: wp.array[wp.vec3],
+    quat_inv_masses: wp.array[wp.float32],
     dt: float,
 ):
     """Integrate orientations after constraint projection.
@@ -169,15 +169,15 @@ def _warp_integrate_rotations(
 
 @wp.kernel
 def _warp_predict_positions_batched(
-    positions: wp.array(dtype=wp.vec3),
-    velocities: wp.array(dtype=wp.vec3),
-    forces: wp.array(dtype=wp.vec3),
-    inv_masses: wp.array(dtype=wp.float32),
-    gravity: wp.array(dtype=wp.vec3),
-    particle_rod_id: wp.array(dtype=wp.int32),
+    positions: wp.array[wp.vec3],
+    velocities: wp.array[wp.vec3],
+    forces: wp.array[wp.vec3],
+    inv_masses: wp.array[wp.float32],
+    gravity: wp.array[wp.vec3],
+    particle_rod_id: wp.array[wp.int32],
     dt: float,
     damping: float,
-    predicted: wp.array(dtype=wp.vec3),
+    predicted: wp.array[wp.vec3],
 ):
     """Predict particle positions for multiple rods in a single launch.
 
@@ -211,10 +211,10 @@ def _warp_predict_positions_batched(
 
 @wp.kernel
 def _warp_integrate_positions_batched(
-    positions: wp.array(dtype=wp.vec3),
-    predicted: wp.array(dtype=wp.vec3),
-    velocities: wp.array(dtype=wp.vec3),
-    inv_masses: wp.array(dtype=wp.float32),
+    positions: wp.array[wp.vec3],
+    predicted: wp.array[wp.vec3],
+    velocities: wp.array[wp.vec3],
+    inv_masses: wp.array[wp.float32],
     dt: float,
 ):
     """Integrate positions for multiple rods in a single launch.
@@ -239,13 +239,13 @@ def _warp_integrate_positions_batched(
 
 @wp.kernel
 def _warp_predict_rotations_batched(
-    orientations: wp.array(dtype=wp.quat),
-    angular_velocities: wp.array(dtype=wp.vec3),
-    torques: wp.array(dtype=wp.vec3),
-    quat_inv_masses: wp.array(dtype=wp.float32),
+    orientations: wp.array[wp.quat],
+    angular_velocities: wp.array[wp.vec3],
+    torques: wp.array[wp.vec3],
+    quat_inv_masses: wp.array[wp.float32],
     dt: float,
     damping: float,
-    predicted: wp.array(dtype=wp.quat),
+    predicted: wp.array[wp.quat],
 ):
     """Predict rotations for multiple rods in a single launch.
 
@@ -285,11 +285,11 @@ def _warp_predict_rotations_batched(
 
 @wp.kernel
 def _warp_integrate_rotations_batched(
-    orientations: wp.array(dtype=wp.quat),
-    predicted: wp.array(dtype=wp.quat),
-    prev_orientations: wp.array(dtype=wp.quat),
-    angular_velocities: wp.array(dtype=wp.vec3),
-    quat_inv_masses: wp.array(dtype=wp.float32),
+    orientations: wp.array[wp.quat],
+    predicted: wp.array[wp.quat],
+    prev_orientations: wp.array[wp.quat],
+    angular_velocities: wp.array[wp.vec3],
+    quat_inv_masses: wp.array[wp.float32],
     dt: float,
 ):
     """Integrate rotations for multiple rods in a single launch.

@@ -57,9 +57,9 @@ from .kernels_math import (
 
 @wp.kernel
 def _warp_cholesky_solve_tile(
-    A: wp.array2d(dtype=wp.float32),
-    b: wp.array(dtype=wp.float32),
-    x: wp.array(dtype=wp.float32),
+    A: wp.array2d[wp.float32],
+    b: wp.array[wp.float32],
+    x: wp.array[wp.float32],
 ):
     """Solve a system using tiled Cholesky decomposition.
 
@@ -79,13 +79,13 @@ def _warp_cholesky_solve_tile(
 
 @wp.kernel
 def _warp_block_thomas_solve(
-    diag_blocks: wp.array(dtype=wp.float32),
-    offdiag_blocks: wp.array(dtype=wp.float32),
-    rhs: wp.array(dtype=wp.float32),
+    diag_blocks: wp.array[wp.float32],
+    offdiag_blocks: wp.array[wp.float32],
+    rhs: wp.array[wp.float32],
     n_edges: int,
-    c_blocks: wp.array(dtype=wp.float32),
-    d_prime: wp.array(dtype=wp.float32),
-    x: wp.array(dtype=wp.float32),
+    c_blocks: wp.array[wp.float32],
+    d_prime: wp.array[wp.float32],
+    x: wp.array[wp.float32],
 ):
     """Solve a block-tridiagonal system using Thomas algorithm.
 
@@ -174,14 +174,14 @@ def _warp_block_thomas_solve(
 
 @wp.kernel
 def _warp_block_thomas_solve_batched(
-    diag_blocks: wp.array(dtype=wp.float32),
-    offdiag_blocks: wp.array(dtype=wp.float32),
-    rhs: wp.array(dtype=wp.float32),
-    edge_offsets: wp.array(dtype=wp.int32),
+    diag_blocks: wp.array[wp.float32],
+    offdiag_blocks: wp.array[wp.float32],
+    rhs: wp.array[wp.float32],
+    edge_offsets: wp.array[wp.int32],
     n_rods: int,
-    c_blocks: wp.array(dtype=wp.float32),
-    d_prime: wp.array(dtype=wp.float32),
-    x: wp.array(dtype=wp.float32),
+    c_blocks: wp.array[wp.float32],
+    d_prime: wp.array[wp.float32],
+    x: wp.array[wp.float32],
 ):
     """Solve block-tridiagonal systems for multiple rods in parallel.
 
@@ -296,13 +296,13 @@ def _warp_block_thomas_solve_batched(
 
 @wp.kernel
 def _warp_block_thomas_solve_3x3(
-    diag_blocks: wp.array(dtype=wp.float32),
-    offdiag_blocks: wp.array(dtype=wp.float32),
-    rhs: wp.array(dtype=wp.float32),
+    diag_blocks: wp.array[wp.float32],
+    offdiag_blocks: wp.array[wp.float32],
+    rhs: wp.array[wp.float32],
     n_edges: int,
-    c_blocks: wp.array(dtype=wp.float32),
-    d_prime: wp.array(dtype=wp.float32),
-    x: wp.array(dtype=wp.float32),
+    c_blocks: wp.array[wp.float32],
+    d_prime: wp.array[wp.float32],
+    x: wp.array[wp.float32],
 ):
     """Solve a 3x3 block-tridiagonal system using Thomas algorithm.
 
@@ -411,8 +411,8 @@ def _warp_block_thomas_solve_3x3(
 @wp.kernel
 def _warp_spbsv_u11_1rhs(
     n: int,
-    ab: wp.array2d(dtype=wp.float32),
-    b: wp.array(dtype=wp.float32),
+    ab: wp.array2d[wp.float32],
+    b: wp.array[wp.float32],
 ):
     """Solve a banded SPD system using Cholesky decomposition.
 
@@ -489,9 +489,9 @@ def _warp_spbsv_u11_1rhs(
 
 @wp.kernel
 def _warp_solve_blocks_jacobi(
-    diag_blocks: wp.array(dtype=wp.float32),
-    rhs: wp.array(dtype=wp.float32),
-    delta_lambda: wp.array(dtype=wp.float32),
+    diag_blocks: wp.array[wp.float32],
+    rhs: wp.array[wp.float32],
+    delta_lambda: wp.array[wp.float32],
     n_edges: int,
 ):
     """Solve each 6x6 diagonal block independently (Block Jacobi iteration).

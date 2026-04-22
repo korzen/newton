@@ -145,7 +145,8 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-warp-lang = { index = "nvidia" }
+warp-lang = { path = "../warp-stable", editable = true }
+
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },
     { index = "pytorch-cu130", extra = "torch-cu13" },

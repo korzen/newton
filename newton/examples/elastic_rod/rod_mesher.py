@@ -27,10 +27,10 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
-
 # ---------------------------------------------------------------------------
 # Warp helper functions
 # ---------------------------------------------------------------------------
+
 
 @wp.func
 def _basis_from_direction(w: wp.vec3) -> wp.mat33:
@@ -42,9 +42,7 @@ def _basis_from_direction(w: wp.vec3) -> wp.mat33:
         inv = 1.0 / wp.sqrt(wn[1] * wn[1] + wn[2] * wn[2] + 1e-10)
         u = wp.vec3(0.0, wn[2] * inv, -wn[1] * inv)
     v = wp.cross(wn, u)
-    return wp.mat33(u[0], v[0], wn[0],
-                    u[1], v[1], wn[1],
-                    u[2], v[2], wn[2])
+    return wp.mat33(u[0], v[0], wn[0], u[1], v[1], wn[1], u[2], v[2], wn[2])
 
 
 @wp.func
@@ -53,9 +51,15 @@ def _axis_angle_rotation(angle: float, axis: wp.vec3) -> wp.mat33:
     s = wp.sin(angle)
     c = wp.cos(angle)
     return wp.mat33(
-        a[0]*a[0]+(1.0-a[0]*a[0])*c, a[0]*a[1]*(1.0-c)-a[2]*s, a[0]*a[2]*(1.0-c)+a[1]*s,
-        a[0]*a[1]*(1.0-c)+a[2]*s,    a[1]*a[1]+(1.0-a[1]*a[1])*c, a[1]*a[2]*(1.0-c)-a[0]*s,
-        a[0]*a[2]*(1.0-c)-a[1]*s,    a[1]*a[2]*(1.0-c)+a[0]*s, a[2]*a[2]+(1.0-a[2]*a[2])*c,
+        a[0] * a[0] + (1.0 - a[0] * a[0]) * c,
+        a[0] * a[1] * (1.0 - c) - a[2] * s,
+        a[0] * a[2] * (1.0 - c) + a[1] * s,
+        a[0] * a[1] * (1.0 - c) + a[2] * s,
+        a[1] * a[1] + (1.0 - a[1] * a[1]) * c,
+        a[1] * a[2] * (1.0 - c) - a[0] * s,
+        a[0] * a[2] * (1.0 - c) - a[1] * s,
+        a[1] * a[2] * (1.0 - c) + a[0] * s,
+        a[2] * a[2] + (1.0 - a[2] * a[2]) * c,
     )
 
 
@@ -63,21 +67,26 @@ def _axis_angle_rotation(angle: float, axis: wp.vec3) -> wp.mat33:
 def _hermite_pos(p1: wp.vec3, p2: wp.vec3, m1: wp.vec3, m2: wp.vec3, t: float) -> wp.vec3:
     t2 = t * t
     t3 = t2 * t
-    return p1*(1.0 - 3.0*t2 + 2.0*t3) + p2*t2*(3.0 - 2.0*t) + m1*(t3 - 2.0*t2 + t) + m2*t2*(t - 1.0)
+    return p1 * (1.0 - 3.0 * t2 + 2.0 * t3) + p2 * t2 * (3.0 - 2.0 * t) + m1 * (t3 - 2.0 * t2 + t) + m2 * t2 * (t - 1.0)
 
 
 @wp.func
 def _hermite_tan(p1: wp.vec3, p2: wp.vec3, m1: wp.vec3, m2: wp.vec3, t: float) -> wp.vec3:
     t2 = t * t
-    return p1*(6.0*t2 - 6.0*t) + p2*(-6.0*t2 + 6.0*t) + m1*(3.0*t2 - 4.0*t + 1.0) + m2*(3.0*t2 - 2.0*t)
+    return (
+        p1 * (6.0 * t2 - 6.0 * t)
+        + p2 * (-6.0 * t2 + 6.0 * t)
+        + m1 * (3.0 * t2 - 4.0 * t + 1.0)
+        + m2 * (3.0 * t2 - 2.0 * t)
+    )
 
 
 @wp.func
 def _mesh_one_rod(
-    positions: wp.array(dtype=wp.vec3),
-    vertices: wp.array(dtype=wp.vec3),
-    normals: wp.array(dtype=wp.vec3),
-    frames: wp.array(dtype=wp.float32),
+    positions: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    frames: wp.array[wp.float32],
     pos_offset: int,
     vert_offset: int,
     frame_offset: int,
@@ -164,12 +173,13 @@ def _mesh_one_rod(
 # Single-rod kernel (backward compat)
 # ---------------------------------------------------------------------------
 
+
 @wp.kernel
 def _update_mesh_kernel(
-    positions: wp.array(dtype=wp.vec3),
-    vertices: wp.array(dtype=wp.vec3),
-    normals: wp.array(dtype=wp.vec3),
-    frame: wp.array(dtype=wp.float32),
+    positions: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    frame: wp.array[wp.float32],
     num_points: int,
     resolution: int,
     smoothing: int,
@@ -178,41 +188,47 @@ def _update_mesh_kernel(
     tid = wp.tid()
     if tid != 0:
         return
-    _mesh_one_rod(positions, vertices, normals, frame,
-                  0, 0, 0, num_points, resolution, smoothing, radius)
+    _mesh_one_rod(positions, vertices, normals, frame, 0, 0, 0, num_points, resolution, smoothing, radius)
 
 
 # ---------------------------------------------------------------------------
 # Batched kernel — one thread per rod
 # ---------------------------------------------------------------------------
 
+
 @wp.kernel
 def _update_mesh_batched_kernel(
-    positions: wp.array(dtype=wp.vec3),
-    vertices: wp.array(dtype=wp.vec3),
-    normals: wp.array(dtype=wp.vec3),
-    frames: wp.array(dtype=wp.float32),
-    pos_offsets: wp.array(dtype=wp.int32),
-    vert_offsets: wp.array(dtype=wp.int32),
-    num_points_arr: wp.array(dtype=wp.int32),
+    positions: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    frames: wp.array[wp.float32],
+    pos_offsets: wp.array[wp.int32],
+    vert_offsets: wp.array[wp.int32],
+    num_points_arr: wp.array[wp.int32],
     resolution: int,
     smoothing: int,
     radius: float,
 ):
     rod_idx = wp.tid()
     _mesh_one_rod(
-        positions, vertices, normals, frames,
+        positions,
+        vertices,
+        normals,
+        frames,
         pos_offsets[rod_idx],
         vert_offsets[rod_idx],
         rod_idx * 9,
         num_points_arr[rod_idx],
-        resolution, smoothing, radius,
+        resolution,
+        smoothing,
+        radius,
     )
 
 
 # ---------------------------------------------------------------------------
 # Public classes
 # ---------------------------------------------------------------------------
+
 
 def _build_topology(num_rings: int, resolution: int) -> tuple[np.ndarray, np.ndarray]:
     """Build static index + UV arrays for one tube."""
@@ -372,9 +388,7 @@ class BatchedRodMesher:
         # Per-rod offsets into positions and vertex arrays
         if particle_offsets is None:
             particle_offsets = [i * num_points for i in range(num_rods)]
-        self._pos_offsets = wp.array(
-            np.array(particle_offsets, dtype=np.int32), dtype=wp.int32, device=self.device
-        )
+        self._pos_offsets = wp.array(np.array(particle_offsets, dtype=np.int32), dtype=wp.int32, device=self.device)
         vert_offsets = np.array([i * verts_per_rod for i in range(num_rods)], dtype=np.int32)
         self._vert_offsets = wp.array(vert_offsets, dtype=wp.int32, device=self.device)
         self._num_points_arr = wp.array(

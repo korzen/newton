@@ -147,6 +147,52 @@ def create_parallel_transport_cable_quaternions(
     return quats
 
 
+def create_parallel_transport_rod_quaternions(points: Sequence[wp.vec3]) -> list[wp.quat]:
+    """Generate per-node material-frame quaternions for an open rod polyline.
+
+    The returned quaternions rotate local ``+Z`` to a node tangent while
+    transporting the frame with minimal twist along the polyline.
+
+    Args:
+        points: Rod points of length >= 2.
+
+    Returns:
+        List of ``wp.quat`` of length ``len(points)``.
+    """
+    if len(points) < 2:
+        raise ValueError("points must have length >= 2")
+
+    eps = 1.0e-8
+    edge_dirs: list[wp.vec3] = []
+
+    for i in range(len(points) - 1):
+        seg = points[i + 1] - points[i]
+        seg_len = float(wp.length(seg))
+        if seg_len <= 0.0:
+            raise ValueError("points must not contain duplicate consecutive points")
+        edge_dirs.append(seg / seg_len)
+
+    tangents: list[wp.vec3] = []
+    tangents.append(edge_dirs[0])
+
+    for i in range(1, len(points) - 1):
+        tangent = edge_dirs[i - 1] + edge_dirs[i]
+        tangent_len = float(wp.length(tangent))
+        if tangent_len <= eps:
+            tangent = edge_dirs[i]
+            tangent_len = float(wp.length(tangent))
+        tangents.append(tangent / tangent_len)
+
+    tangents.append(edge_dirs[-1])
+
+    quats: list[wp.quat] = [quat_between_vectors_robust(wp.vec3(0.0, 0.0, 1.0), tangents[0], eps)]
+    for i in range(1, len(tangents)):
+        dq = quat_between_vectors_robust(tangents[i - 1], tangents[i], eps)
+        quats.append(wp.mul(dq, quats[i - 1]))
+
+    return quats
+
+
 def create_straight_cable_points_and_quaternions(
     start: wp.vec3,
     direction: wp.vec3,

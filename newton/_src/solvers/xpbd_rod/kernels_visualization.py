@@ -8,14 +8,14 @@ import warp as wp
 
 @wp.kernel
 def compute_director_lines_kernel(
-    particle_q: wp.array(dtype=wp.vec3),
-    edge_q: wp.array(dtype=wp.quat),
+    particle_q: wp.array[wp.vec3],
+    edge_q: wp.array[wp.quat],
     num_edges: int,
     axis_length: float,
     # outputs: 3 axes per edge (d1=red, d2=green, d3=blue)
-    line_starts: wp.array(dtype=wp.vec3),
-    line_ends: wp.array(dtype=wp.vec3),
-    line_colors: wp.array(dtype=wp.vec3),
+    line_starts: wp.array[wp.vec3],
+    line_ends: wp.array[wp.vec3],
+    line_colors: wp.array[wp.vec3],
 ):
     """Compute line segments for visualizing material frames.
 
