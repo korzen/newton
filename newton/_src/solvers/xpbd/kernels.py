@@ -888,6 +888,42 @@ def apply_body_delta_velocities(
 
 
 @wp.kernel
+def init_cable_joint_rest_state(
+    body_q: wp.array[wp.transform],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    cable_rest_length: wp.array[float],
+    cable_rest_rotation: wp.array[wp.quat],
+):
+    tid = wp.tid()
+
+    if joint_type[tid] != JointType.CABLE:
+        cable_rest_length[tid] = 0.0
+        cable_rest_rotation[tid] = wp.quat_identity()
+        return
+
+    id_p = joint_parent[tid]
+    id_c = joint_child[tid]
+
+    pose_p = joint_X_p[tid]
+    if id_p >= 0:
+        pose_p = body_q[id_p]
+
+    pose_c = body_q[id_c]
+
+    p_p = wp.transform_get_translation(pose_p)
+    p_c = wp.transform_get_translation(pose_c)
+
+    q_p = wp.transform_get_rotation(pose_p)
+    q_c = wp.transform_get_rotation(pose_c)
+
+    cable_rest_length[tid] = wp.max(wp.length(p_c - p_p), 1.0e-6)
+    cable_rest_rotation[tid] = wp.normalize(wp.quat_inverse(q_p) * q_c)
+
+
+@wp.kernel
 def apply_joint_forces(
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
@@ -1029,6 +1065,50 @@ def update_joint_axis_weighted_target(
     axis_weights += vec_abs(weighted_axis)
 
     return wp.spatial_vector(axis_targets, axis_weights)
+
+
+@wp.func
+def quat_length_sq(q: wp.quat) -> float:
+    return q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]
+
+
+@wp.func
+def cable_body_quat_inv_mass(I_inv: wp.mat33) -> float:
+    return (I_inv[0, 0] + I_inv[1, 1] + I_inv[2, 2]) / 3.0
+
+
+@wp.func
+def cable_position_correction_to_linear_delta(corr: wp.vec3, inv_mass: float, dt: float) -> wp.vec3:
+    if inv_mass == 0.0:
+        return wp.vec3(0.0)
+    return corr / (inv_mass * dt)
+
+
+@wp.func
+def cable_quat_correction_to_angular_delta(corrq: wp.quat, q: wp.quat, inv_massq: float, dt: float) -> wp.vec3:
+    if inv_massq == 0.0:
+        return wp.vec3(0.0)
+    # The Cosserat local solves return an additive quaternion update dq such that
+    # q_new ~= normalize(q + dq). XPBD body deltas integrate orientation as
+    # q_new ~= normalize(q + 0.5 * quat(dw * dt, 0) * q), so we recover the
+    # equivalent world-space angular update from dq * q^{-1}.
+    dq = corrq * wp.quat_inverse(q)
+    theta = 2.0 * wp.vec3(dq[0], dq[1], dq[2])
+    return theta / (inv_massq * dt)
+
+
+@wp.func
+def cable_relative_rotation_error(q_p: wp.quat, q_c: wp.quat, q_rel_rest: wp.quat) -> wp.vec3:
+    q_rel = wp.normalize(wp.quat_inverse(q_p) * q_c)
+    q_align = wp.normalize(q_rel * wp.quat_inverse(q_rel_rest))
+
+    # Use the shortest equivalent quaternion so small rest-bend edits do not
+    # alias to the long way around SO(3).
+    if q_align[3] < 0.0:
+        q_align = wp.quat(-q_align[0], -q_align[1], -q_align[2], -q_align[3])
+
+    axis, angle = wp.quat_to_axis_angle(q_align)
+    return axis * angle
 
 
 @wp.func
@@ -1455,6 +1535,8 @@ def solve_body_joints(
     joint_limit_upper: wp.array[float],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
+    cable_rest_length: wp.array[float],
+    cable_rest_rotation: wp.array[wp.quat],
     joint_axis: wp.array[wp.vec3],
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
@@ -1544,7 +1626,72 @@ def solve_body_joints(
     world_com_c = wp.transform_point(pose_c, com_c)
 
     # handle positional constraints
-    if type == JointType.DISTANCE:
+    if type == JointType.CABLE:
+        q_p = wp.transform_get_rotation(pose_p)
+        q_c = wp.transform_get_rotation(pose_c)
+
+        stretch_ke = joint_target_ke[axis_start]
+        if stretch_ke > 0.0:
+            stretch_kd = wp.max(joint_target_kd[axis_start], 0.0)
+            rest_length = cable_rest_length[tid]
+            inv_massq_p = cable_body_quat_inv_mass(I_inv_p)
+
+            d3 = wp.vec3(
+                2.0 * (q_p[0] * q_p[2] + q_p[3] * q_p[1]),
+                2.0 * (q_p[1] * q_p[2] - q_p[3] * q_p[0]),
+                q_p[3] * q_p[3] - q_p[0] * q_p[0] - q_p[1] * q_p[1] + q_p[2] * q_p[2],
+            )
+
+            gamma = (wp.transform_get_translation(pose_c) - wp.transform_get_translation(pose_p)) / rest_length - d3
+            stretch_damping = stretch_kd / (stretch_ke * dt)
+            gamma_dot = (vel_c - vel_p) / rest_length - wp.cross(omega_p, d3)
+            stretch_denom = (m_inv_p + m_inv_c) / rest_length + inv_massq_p * 4.0 * rest_length
+            gamma = (gamma + stretch_damping * dt * gamma_dot) / (
+                (1.0 + stretch_damping) * stretch_denom + 1.0 / (stretch_ke * dt * dt)
+            )
+
+            corr_p = m_inv_p * gamma
+            corr_c = -m_inv_c * gamma
+
+            q_e3_bar = wp.quat(-q_p[1], q_p[0], -q_p[3], q_p[2])
+            corrq_p = wp.quat(gamma[0], gamma[1], gamma[2], 0.0) * q_e3_bar
+            corrq_p *= 2.0 * inv_massq_p * rest_length
+
+            lin_delta_p += cable_position_correction_to_linear_delta(corr_p, m_inv_p, dt) * linear_relaxation
+            lin_delta_c += cable_position_correction_to_linear_delta(corr_c, m_inv_c, dt) * linear_relaxation
+            ang_delta_p += cable_quat_correction_to_angular_delta(corrq_p, q_p, inv_massq_p, dt) * angular_relaxation
+
+        if ang_axis_count > 0:
+            bend_idx = axis_start + lin_axis_count
+            bend_ke = joint_target_ke[bend_idx]
+            if bend_ke > 0.0:
+                bend_kd = wp.max(joint_target_kd[bend_idx], 0.0)
+                kappa_parent = cable_relative_rotation_error(q_p, q_c, cable_rest_rotation[tid])
+                corr = wp.quat_rotate(q_p, kappa_parent)
+                theta = wp.length(corr)
+                if theta > 0.0:
+                    ncorr = corr / theta
+                    derr = wp.dot(ncorr, omega_c - omega_p)
+                    target_compliance = 1.0 / bend_ke
+                    lambda_n = compute_angular_correction(
+                        theta,
+                        derr,
+                        pose_p,
+                        pose_c,
+                        I_inv_p,
+                        I_inv_c,
+                        -ncorr,
+                        ncorr,
+                        0.0,
+                        target_compliance,
+                        bend_kd,
+                        dt,
+                    )
+                    lambda_n *= angular_relaxation
+                    ang_delta_p -= lambda_n * ncorr
+                    ang_delta_c += lambda_n * ncorr
+
+    elif type == JointType.DISTANCE:
         r_p = wp.transform_get_translation(X_wp) - world_com_p
         r_c = wp.transform_get_translation(X_wc) - world_com_c
         lower = joint_limit_lower[axis_start]

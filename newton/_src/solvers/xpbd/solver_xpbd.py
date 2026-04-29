@@ -18,6 +18,7 @@ from .kernels import (
     bending_constraint,
     convert_contact_impulse_to_force,
     copy_kinematic_body_state_kernel,
+    init_cable_joint_rest_state,
     solve_body_contact_positions,
     solve_body_joints,
     solve_particle_particle_contacts,
@@ -50,12 +51,14 @@ class SolverXPBD(SolverBase):
         which is symmetric but not exact.
 
     Joint limitations:
-        - Supported joint types: PRISMATIC, REVOLUTE, BALL, FIXED, FREE, DISTANCE, D6.
-          CABLE joints are not supported.
-        - :attr:`~newton.Model.joint_enabled`,
-          :attr:`~newton.Model.joint_target_ke`/:attr:`~newton.Model.joint_target_kd`, and
-          :attr:`~newton.Control.joint_f` are supported.
-          Joint limits are enforced as hard positional constraints (``joint_limit_ke``/``joint_limit_kd`` are not used).
+        - Supported joint types: PRISMATIC, REVOLUTE, BALL, FIXED, FREE, DISTANCE, D6, CABLE.
+          XPBD cable joints use a local Cosserat-style segment-body approximation and currently ignore
+          attachment-frame/material-frame misalignment.
+        - :attr:`~newton.Model.joint_enabled` is supported for all joint types.
+          :attr:`~newton.Model.joint_target_ke` is supported for all supported joint types, and
+          :attr:`~newton.Model.joint_target_kd` is supported for CABLE stretch and bend damping.
+          :attr:`~newton.Control.joint_f` is not currently used for CABLE joints.
+        Joint limits are enforced as hard positional constraints (``joint_limit_ke``/``joint_limit_kd`` are not used).
         - :attr:`~newton.Model.joint_armature`, :attr:`~newton.Model.joint_friction`,
           :attr:`~newton.Model.joint_effort_limit`, :attr:`~newton.Model.joint_velocity_limit`,
           and :attr:`~newton.Model.joint_target_mode` are not supported.
@@ -113,6 +116,7 @@ class SolverXPBD(SolverBase):
         self.compute_body_velocity_from_position_delta = False
 
         self._init_kinematic_state()
+        self._init_cable_joint_rest_state()
 
         # helper variables to track constraint resolution vars
         self._particle_delta_counter = 0
@@ -127,6 +131,28 @@ class SolverXPBD(SolverBase):
     def notify_model_changed(self, flags: int) -> None:
         if flags & (SolverNotifyFlags.BODY_PROPERTIES | SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
             self._refresh_kinematic_state()
+        if flags & (SolverNotifyFlags.BODY_PROPERTIES | SolverNotifyFlags.JOINT_PROPERTIES):
+            self._init_cable_joint_rest_state()
+
+    def _init_cable_joint_rest_state(self) -> None:
+        model = self.model
+        self.cable_joint_rest_length = wp.zeros(model.joint_count, dtype=float, device=model.device)
+        self.cable_joint_rest_rotation = wp.zeros(model.joint_count, dtype=wp.quat, device=model.device)
+        if model.joint_count == 0:
+            return
+        wp.launch(
+            kernel=init_cable_joint_rest_state,
+            dim=model.joint_count,
+            inputs=[
+                model.body_q,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_X_p,
+            ],
+            outputs=[self.cable_joint_rest_length, self.cable_joint_rest_rotation],
+            device=model.device,
+        )
 
     def copy_kinematic_body_state(self, model: Model, state_in: State, state_out: State):
         if model.body_count == 0:
@@ -591,6 +617,8 @@ class SolverXPBD(SolverBase):
                                 model.joint_limit_upper,
                                 model.joint_qd_start,
                                 model.joint_dof_dim,
+                                self.cable_joint_rest_length,
+                                self.cable_joint_rest_rotation,
                                 model.joint_axis,
                                 control.joint_target_pos,
                                 control.joint_target_vel,
