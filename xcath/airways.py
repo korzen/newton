@@ -24,9 +24,9 @@ import newton.usd
 from newton.solvers import xpbd_rod
 
 try:
-    from xcath.xcath_solver import XCathRodSolver, compute_signed_distances
+    from xcath.xcath_solver import XCathRodSolver, compute_signed_distances, compute_smooth_vertex_normals
 except ImportError:
-    from xcath_solver import XCathRodSolver, compute_signed_distances
+    from xcath_solver import XCathRodSolver, compute_signed_distances, compute_smooth_vertex_normals
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -36,12 +36,14 @@ NUM_POINTS = 128
 SEGMENT_LENGTH = 0.025
 PARTICLE_MASS = 1.0
 PARTICLE_RADIUS = 0.02
-ROD_MESH_RADIUS = 0.015
 MESH_SCALE = 0.01
-SUBSTEPS = 4
-COLLISION_ITERATIONS = 2
+SUBSTEPS = 8
+COLLISION_ITERATIONS = 1
 TIP_NUM_EDGES = 15
 MESH_PRIM_PATH = "/root/airways/airways"
+LINEAR_DAMPING = 0.01
+ANGULAR_DAMPING = 0.01
+DAMPING_SLIDER_MAX = 0.2
 
 # ---------------------------------------------------------------------------
 # Warp kernels
@@ -60,6 +62,20 @@ def _set_root_position_kernel(
         return
     positions[0] = new_pos
     predicted[0] = new_pos
+
+
+@wp.kernel
+def _set_particle_radius_kernel(
+    particle_radius: wp.array(dtype=wp.float32),
+    start: int,
+    count: int,
+    radius: float,
+):
+    i = wp.tid()
+    if i >= count:
+        return
+    particle_radius[start + i] = radius
+
 
 @wp.kernel
 def _update_tip_rest_darboux_kernel(
@@ -144,18 +160,23 @@ class Example:
         # Tuneable parameters
         self.bend_stiffness = 1.0
         self.twist_stiffness = 1.0
-        self.young_modulus = 1.0e6
-        self.torsion_modulus = 1.0e6
+        self.young_modulus = 10_000_000.0
+        self.torsion_modulus = 1_000_000_000.0
+        self.linear_damping = LINEAR_DAMPING
+        self.angular_damping = ANGULAR_DAMPING
         self.gravity_enabled = False
         self.track_enabled = True
         self.track_stiffness = 1.0
         self.collision_enabled = True
+        self.collision_radius = PARTICLE_RADIUS
         self.collision_iterations = COLLISION_ITERATIONS
+        self.smooth_collision_normals_enabled = False
 
         # Controls
         self.insertion = 0.0
         self.root_rotation = 0.0
         self.tip_bend_angle = 0.0
+        self.tip_num_edges = TIP_NUM_EDGES
         self._g_pressed = False
 
         # --- Load aorta mesh ---
@@ -181,6 +202,7 @@ class Example:
         # Build initial transformed mesh arrays
         self.aorta_verts_wp = None
         self.aorta_normals_wp = None
+        self.collision_normals_wp = None
         self.aorta_indices_wp = wp.array(self._raw_indices, dtype=wp.int32, device=self.device)
         self.collision_mesh = None
         self._rebuild_aorta_mesh()
@@ -203,7 +225,7 @@ class Example:
         xpbd_rod.add_elastic_rod(
             builder,
             positions=positions,
-            radius=PARTICLE_RADIUS,
+            radius=self.collision_radius,
             particle_mass=PARTICLE_MASS,
             bend_stiffness=self.bend_stiffness,
             twist_stiffness=self.twist_stiffness,
@@ -221,21 +243,23 @@ class Example:
 
         self.solver = XCathRodSolver(
             model=self.model,
-            linear_damping=0.001,
-            angular_damping=0.001,
+            linear_damping=self.linear_damping,
+            angular_damping=self.angular_damping,
             solver_backend="block_thomas",
             floor_z=None,
             collision_mesh=self.collision_mesh,
+            collision_mesh_normals=self.collision_normals_wp,
             track_start=self.track_start,
             track_dir=self.track_dir,
             track_length=self.track_length,
-            tip_num_edges=TIP_NUM_EDGES,
-            particle_radius=PARTICLE_RADIUS,
+            tip_num_edges=self.tip_num_edges,
+            particle_radius=self.collision_radius,
             segment_length=SEGMENT_LENGTH,
             track_stiffness=self.track_stiffness,
             track_enabled=self.track_enabled,
             collision_enabled=self.collision_enabled,
             collision_iterations=COLLISION_ITERATIONS,
+            smooth_collision_normals_enabled=self.smooth_collision_normals_enabled,
             sign_scale=-1.0,
         )
 
@@ -254,7 +278,7 @@ class Example:
         # Rod tube mesher
         self.mesher = xpbd_rod.RodMesher(
             num_points=NUM_POINTS,
-            radius=ROD_MESH_RADIUS,
+            radius=self.collision_radius,
             resolution=8,
             smoothing=3,
             device=self.device,
@@ -262,6 +286,23 @@ class Example:
 
         self.viewer.set_model(self.model)
         self.viewer.show_particles = False
+
+    def _apply_collision_radius(self):
+        """Apply collision radius to solver and visual radius buffers."""
+        radius = max(0.001, float(self.collision_radius))
+        self.collision_radius = radius
+        self.solver.target_phi = -radius
+        self.solver.max_dist = 2.0 * radius + SEGMENT_LENGTH
+        self.solver.mesh_edge_collision_radius = radius
+        self.solver.mesh_edge_collision_query_radius = radius
+        self.mesher.radius = radius
+        if self.model.particle_radius is not None:
+            wp.launch(
+                _set_particle_radius_kernel,
+                dim=NUM_POINTS,
+                inputs=[self.model.particle_radius, self.rod_particle_start, NUM_POINTS, radius],
+                device=self.device,
+            )
 
     # ----- Mesh transform -----
 
@@ -277,12 +318,16 @@ class Example:
             if normals is not None
             else None
         )
+        collision_normals = normals
+        if collision_normals is None or collision_normals.shape[0] != verts.shape[0]:
+            collision_normals = compute_smooth_vertex_normals(verts, self._raw_indices)
+        self.collision_normals_wp = wp.array(collision_normals, dtype=wp.vec3, device=self.device)
         self.collision_mesh = wp.Mesh(
             points=wp.array(verts, dtype=wp.vec3, device=self.device),
             indices=wp.array(self._raw_indices, dtype=wp.int32, device=self.device),
         )
         if hasattr(self, "solver"):
-            self.solver.set_collision_mesh(self.collision_mesh)
+            self.solver.set_collision_mesh(self.collision_mesh, self.collision_normals_wp)
 
     # ----- Input handling -----
 
@@ -304,16 +349,16 @@ class Example:
         dt = self.frame_dt
 
         # Insertion
-        if v.is_key_down(KEY.PAGEUP) or v.is_key_down("2"):
+        if v.is_key_down(KEY.PAGEUP) or v.is_key_down("2") or v.is_key_down("i"):
             self.insertion += insert_speed * dt
-        if v.is_key_down(KEY.PAGEDOWN) or v.is_key_down("1"):
+        if v.is_key_down(KEY.PAGEDOWN) or v.is_key_down("1") or v.is_key_down("k"):
             self.insertion -= insert_speed * dt
         self.insertion = max(0.0, self.insertion)
 
         # Root rotation around local Z
-        if v.is_key_down(KEY.COMMA):
+        if v.is_key_down(KEY.COMMA) or v.is_key_down("j"):
             self.root_rotation -= rotate_speed * dt
-        if v.is_key_down(KEY.PERIOD):
+        if v.is_key_down(KEY.PERIOD) or v.is_key_down("l"):
             self.root_rotation += rotate_speed * dt
 
         # Tip bending
@@ -362,7 +407,7 @@ class Example:
         wp.launch(
             _update_tip_rest_darboux_kernel,
             dim=ws.num_edges,
-            inputs=[ws.rest_darboux_wp, ws.num_edges, TIP_NUM_EDGES, self.tip_bend_angle],
+            inputs=[ws.rest_darboux_wp, ws.num_edges, self.tip_num_edges, self.tip_bend_angle],
             device=self.device,
         )
 
@@ -372,7 +417,13 @@ class Example:
         self._handle_input()
         self.solver.track_enabled = self.track_enabled
         self.solver.track_stiffness = self.track_stiffness
+        self.solver.linear_damping = max(0.0, min(DAMPING_SLIDER_MAX, float(self.linear_damping)))
+        self.solver.angular_damping = max(0.0, min(DAMPING_SLIDER_MAX, float(self.angular_damping)))
+        self.tip_num_edges = max(1, min(self.ws.num_edges, int(self.tip_num_edges)))
+        self.solver.tip_num_edges = self.tip_num_edges
+        self._apply_collision_radius()
         self.solver.collision_enabled = self.collision_enabled
+        self.solver.smooth_collision_normals_enabled = self.smooth_collision_normals_enabled
 
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.solver.collision_iterations = max(1, int(self.collision_iterations))
@@ -466,9 +517,12 @@ class Example:
         imgui.text("XCATH Catheter Simulation")
         imgui.separator()
 
-        _, self.insertion = imgui.slider_float("Insertion [m]", self.insertion, 0.0, 5.0)
+        _, self.insertion = imgui.slider_float("Insertion [m]", self.insertion, 0.0, 10.0)
         _, self.tip_bend_angle = imgui.slider_float(
             "Tip Bend [rad]", self.tip_bend_angle, -1.5, 1.5
+        )
+        _, self.tip_num_edges = imgui.slider_int(
+            "Tip Bend Segments", self.tip_num_edges, 1, self.ws.num_edges
         )
         _, self.root_rotation = imgui.slider_float(
             "Root Rotation [rad]", self.root_rotation, -math.pi, math.pi
@@ -483,6 +537,9 @@ class Example:
 
         _, self.track_enabled = imgui.checkbox("Track Sliding", self.track_enabled)
         _, self.collision_enabled = imgui.checkbox("Mesh Collision", self.collision_enabled)
+        _, self.smooth_collision_normals_enabled = imgui.checkbox(
+            "Use Smooth Collision Normals", self.smooth_collision_normals_enabled
+        )
 
         imgui.separator()
 
@@ -507,12 +564,21 @@ class Example:
         _, self.track_stiffness = imgui.slider_float(
             "Track Stiffness", self.track_stiffness, 0.0, 1.0
         )
+        _, self.linear_damping = imgui.slider_float(
+            "Particle Linear Damping", self.linear_damping, 0.0, DAMPING_SLIDER_MAX
+        )
+        _, self.angular_damping = imgui.slider_float(
+            "Quaternion Rotational Damping", self.angular_damping, 0.0, DAMPING_SLIDER_MAX
+        )
 
         imgui.separator()
 
         _, self.sim_substeps = imgui.slider_int("Substeps", self.sim_substeps, 1, 32)
         _, self.collision_iterations = imgui.slider_int(
             "Collision Iterations", self.collision_iterations, 1, 16
+        )
+        _, self.collision_radius = imgui.slider_float(
+            "Collision Radius [m]", self.collision_radius, 0.001, 0.05
         )
 
         imgui.separator()
@@ -545,7 +611,7 @@ class Example:
 
         imgui.separator()
         imgui.text(f"Sim time: {self.sim_time:.2f}s")
-        imgui.text("Keys: PgUp/PgDn=insert, ,/.=rotate")
+        imgui.text("Keys: PgUp/PgDn or I/K=insert, ,/. or J/L=rotate")
         imgui.text("      +/-=bend tip, G=gravity")
 
     # ----- Test -----

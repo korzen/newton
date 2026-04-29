@@ -485,8 +485,28 @@ class SolverXPBDRod(SolverBase):
         dt: float,
         device: wp.Device,
     ) -> None:
-        """Private extension point for sample-specific predicted-position projection."""
+        """Private post-constraint extension point for predicted-position projection."""
         del rod_idx, ws, dt, device
+
+    def _project_predicted_positions_pre_constraints(
+        self,
+        rod_idx: int,
+        ws: _RodWorkspace,
+        dt: float,
+        device: wp.Device,
+    ) -> None:
+        """Private extension point before rod constraint projection."""
+        del rod_idx, ws, dt, device
+
+    def _project_predicted_positions_post_constraints(
+        self,
+        rod_idx: int,
+        ws: _RodWorkspace,
+        dt: float,
+        device: wp.Device,
+    ) -> None:
+        """Private extension point after rod constraint projection."""
+        self._project_predicted_positions(rod_idx, ws, dt, device)
 
     def _step_rod(self, rod_idx: int, ws: _RodWorkspace, dt: float, device: wp.Device):
         """Run one XPBD step for a single rod."""
@@ -522,7 +542,10 @@ class SolverXPBDRod(SolverBase):
             device=device,
         )
 
-        # 2. Prepare constraints
+        # 2. Private sample hook before rod constraint projection.
+        self._project_predicted_positions_pre_constraints(rod_idx, ws, dt, device)
+
+        # 3. Prepare constraints
         wp.launch(_warp_zero_float, dim=ws.n_dofs, inputs=[ws.lambda_sum_wp], device=device)
         wp.launch(
             _warp_prepare_compliance,
@@ -538,13 +561,13 @@ class SolverXPBDRod(SolverBase):
             device=device,
         )
 
-        # 3. Project constraints
+        # 4. Project constraints
         self._project_direct(ws, device)
 
-        # 4. Private sample hook for additional predicted-position projection.
-        self._project_predicted_positions(rod_idx, ws, dt, device)
+        # 5. Private sample hook after rod constraint projection.
+        self._project_predicted_positions_post_constraints(rod_idx, ws, dt, device)
 
-        # 5. Floor collision (optional)
+        # 6. Floor collision (optional)
         if self.floor_z is not None:
             min_z = float(self.floor_z)
             wp.launch(
@@ -554,7 +577,7 @@ class SolverXPBDRod(SolverBase):
                 device=device,
             )
 
-        # 6. Integrate
+        # 7. Integrate
         wp.launch(
             _warp_integrate_positions,
             dim=ws.num_points,

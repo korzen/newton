@@ -2235,7 +2235,7 @@ class ViewerGL(ViewerBase):
         # Position the window on the left side
         io = self.ui.io
         imgui.set_next_window_pos(imgui.ImVec2(10, 10))
-        imgui.set_next_window_size(imgui.ImVec2(300, io.display_size[1] - 20))
+        imgui.set_next_window_size(imgui.ImVec2(450, io.display_size[1] - 20))
 
         # Main control panel window - use safe flag values
         flags = imgui.WindowFlags_.no_resize.value
