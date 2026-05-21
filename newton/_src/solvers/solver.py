@@ -37,6 +37,7 @@ def integrate_particles(
 
     # simple semi-implicit Euler. v1 = v0 + a dt, x1 = x0 + v1 dt
     v1 = v0 + (f0 * inv_mass + world_g * wp.step(-inv_mass)) * dt
+    v1 = v1 * 0.97
     # enforce velocity limit to prevent instability
     v1_mag = wp.length(v1)
     if v1_mag > v_max:
