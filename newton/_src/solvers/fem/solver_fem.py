@@ -28,6 +28,8 @@ from .kernels import (
     compute_gravity_force,
     refresh_lame_parameters,
     scatter_soft_contact_forces,
+    project_particles_against_infinite_planes,
+    project_particle_drag_constraint,
     sync_displacement_state,
     write_state_outputs,
 )
@@ -128,6 +130,16 @@ class SolverFEM(SolverBase):
         cg_tol: Relative tolerance for the inner CG solve.
         cg_max_iters: Maximum CG iterations per Newton iteration. ``0``
             means equal to the system size.
+        plane_contact_projection_iterations: Number of post-solve position
+            projection iterations against infinite plane shapes. ``0`` keeps
+            the historical FEM-only soft-contact path.
+        plane_contact_projection_relaxation: Normal correction multiplier for
+            plane contact projection. ``1.0`` applies the full correction.
+        particle_drag_projection_iterations: Number of post-solve position
+            projection iterations for an externally supplied picked soft-body
+            surface point. ``0`` disables mouse-drag projection.
+        particle_drag_projection_relaxation: Correction multiplier for the
+            particle drag projection. ``1.0`` applies the full correction.
         fp64: Reserved for future double-precision support; currently
             ignored with a warning.
     """
@@ -145,6 +157,10 @@ class SolverFEM(SolverBase):
         contact_mu: float | None = None,
         cg_tol: float = 1.0e-5,
         cg_max_iters: int = 0,
+        plane_contact_projection_iterations: int = 0,
+        plane_contact_projection_relaxation: float = 1.0,
+        particle_drag_projection_iterations: int = 0,
+        particle_drag_projection_relaxation: float = 1.0,
         fp64: bool = False,
     ):
         super().__init__(model)
@@ -165,6 +181,18 @@ class SolverFEM(SolverBase):
         self._k_damp = float(k_damp)
         self._cg_tol = float(cg_tol)
         self._cg_max_iters = int(cg_max_iters)
+        self.plane_contact_projection_iterations = max(0, int(plane_contact_projection_iterations))
+        self.plane_contact_projection_relaxation = float(plane_contact_projection_relaxation)
+        if self.plane_contact_projection_relaxation < 0.0:
+            raise ValueError("plane_contact_projection_relaxation must be non-negative.")
+        self.particle_drag_projection_iterations = max(0, int(particle_drag_projection_iterations))
+        self.particle_drag_projection_relaxation = float(particle_drag_projection_relaxation)
+        if self.particle_drag_projection_relaxation < 0.0:
+            raise ValueError("particle_drag_projection_relaxation must be non-negative.")
+        self._particle_drag_indices = None
+        self._particle_drag_weights = None
+        self._particle_drag_target = None
+        self._particle_drag_point = None
 
         self._mu_override = k_mu
         self._lambda_override = k_lambda
@@ -358,6 +386,9 @@ class SolverFEM(SolverBase):
                 outputs=[state_out.particle_q, state_out.particle_qd],
             )
 
+            self._apply_plane_contact_projection(state_in, state_out, dt)
+            self._apply_particle_drag_projection(state_in, state_out, dt)
+
     @override
     def notify_model_changed(self, flags: int) -> None:
         if flags & SolverNotifyFlags.SHAPE_PROPERTIES:
@@ -371,6 +402,28 @@ class SolverFEM(SolverBase):
         recreating the solver.
         """
         self._refresh_material_parameters()
+
+    def set_particle_drag_constraint(
+        self,
+        particle_indices: wp.array,
+        particle_weights: wp.array,
+        target_world: wp.array,
+        picked_point_world: wp.array,
+    ) -> None:
+        """Connect an external soft-body mouse-drag target to the FEM solver.
+
+        Args:
+            particle_indices: Three particle indices defining the picked point,
+                or ``[-1, -1, -1]`` when inactive.
+            particle_weights: Barycentric weights for ``particle_indices``.
+            target_world: Single ``wp.vec3`` mouse target in physics space.
+            picked_point_world: Single ``wp.vec3`` updated with the constrained
+                point after projection, for viewer feedback.
+        """
+        self._particle_drag_indices = particle_indices
+        self._particle_drag_weights = particle_weights
+        self._particle_drag_target = target_world
+        self._particle_drag_point = picked_point_world
 
     # ------------------------------------------------------------------
     # Internals
@@ -427,3 +480,67 @@ class SolverFEM(SolverBase):
             ],
             outputs=[self._f_ext],
         )
+
+    def _apply_plane_contact_projection(self, state_in: State, state_out: State, dt: float) -> None:
+        if self.plane_contact_projection_iterations <= 0:
+            return
+        if self.model.shape_count <= 0:
+            return
+        if state_in.particle_q is None or state_out.particle_q is None or state_out.particle_qd is None:
+            return
+
+        model = self.model
+        body_q = state_in.body_q if state_in.body_q is not None else self._empty_body_q
+
+        for _ in range(self.plane_contact_projection_iterations):
+            wp.launch(
+                project_particles_against_infinite_planes,
+                dim=self.particle_count,
+                inputs=[
+                    state_in.particle_q,
+                    state_out.particle_q,
+                    state_out.particle_qd,
+                    model.particle_mass,
+                    model.particle_flags,
+                    model.particle_radius,
+                    model.particle_world,
+                    model.shape_transform,
+                    model.shape_body,
+                    model.shape_type,
+                    model.shape_scale,
+                    model.shape_flags,
+                    model.shape_world,
+                    body_q,
+                    model.shape_count,
+                    dt,
+                    self.plane_contact_projection_relaxation,
+                ],
+            )
+
+    def _apply_particle_drag_projection(self, state_in: State, state_out: State, dt: float) -> None:
+        if self.particle_drag_projection_iterations <= 0:
+            return
+        if self._particle_drag_indices is None:
+            return
+        if state_in.particle_q is None or state_out.particle_q is None or state_out.particle_qd is None:
+            return
+
+        model = self.model
+        for _ in range(self.particle_drag_projection_iterations):
+            wp.launch(
+                project_particle_drag_constraint,
+                dim=1,
+                inputs=[
+                    state_in.particle_q,
+                    state_out.particle_q,
+                    state_out.particle_qd,
+                    model.particle_mass,
+                    model.particle_flags,
+                    self._particle_drag_indices,
+                    self._particle_drag_weights,
+                    self._particle_drag_target,
+                    self._particle_drag_point,
+                    dt,
+                    self.particle_drag_projection_relaxation,
+                ],
+            )

@@ -17,10 +17,15 @@ def _build_single_tet_model(
     k_mu: float = 1.0e3,
     k_lambda: float = 1.0e3,
     fixed_particles: tuple[int, ...] = (),
+    pos_z: float = 0.0,
+    add_ground: bool = False,
+    particle_radius: float | None = None,
 ):
     builder = newton.ModelBuilder(gravity=gravity)
+    if add_ground:
+        builder.add_ground_plane()
     builder.add_soft_mesh(
-        pos=(0.0, 0.0, 0.0),
+        pos=(0.0, 0.0, pos_z),
         rot=wp.quat_identity(),
         scale=1.0,
         vel=(0.0, 0.0, 0.0),
@@ -35,6 +40,7 @@ def _build_single_tet_model(
         k_mu=k_mu,
         k_lambda=k_lambda,
         k_damp=0.0,
+        particle_radius=particle_radius,
         add_surface_mesh_edges=False,
     )
 
@@ -66,8 +72,14 @@ def _build_fixed_grid_model(device, *, gravity: float = -9.81, k_mu: float = 1.0
     return builder.finalize(device=device)
 
 
-def _step_once(model, *, iterations: int, dt: float):
-    solver = newton.solvers.SolverFEM(model, iterations=iterations, cg_tol=1.0e-7, cg_max_iters=128)
+def _step_once(model, *, iterations: int, dt: float, plane_projection_iterations: int = 0):
+    solver = newton.solvers.SolverFEM(
+        model,
+        iterations=iterations,
+        cg_tol=1.0e-7,
+        cg_max_iters=128,
+        plane_contact_projection_iterations=plane_projection_iterations,
+    )
     state_in = model.state()
     state_out = model.state()
     solver.step(state_in, state_out, None, None, dt)
@@ -134,6 +146,96 @@ def test_fem_material_refresh_changes_deformation(test, device):
     test.assertGreater(stiff_q[3, 2], soft_q[3, 2])
 
 
+def test_fem_plane_projection_clamps_ground_penetration(test, device):
+    radius = 0.1
+    model = _build_single_tet_model(device, gravity=0.0, pos_z=-0.25, add_ground=True, particle_radius=radius)
+
+    q, qd, _solver = _step_once(model, iterations=1, dt=0.1, plane_projection_iterations=1)
+
+    np.testing.assert_allclose(q[:3, 2], radius, rtol=0.0, atol=1.0e-6)
+    test.assertGreater(q[3, 2], radius)
+    test.assertTrue(np.all(qd[:3, 2] >= -1.0e-6))
+
+
+def test_fem_plane_projection_preserves_fixed_particles(test, device):
+    radius = 0.1
+    fixed = (0,)
+    model = _build_single_tet_model(
+        device,
+        gravity=0.0,
+        pos_z=-0.25,
+        add_ground=True,
+        particle_radius=radius,
+        fixed_particles=fixed,
+    )
+    rest = model.particle_q.numpy()
+
+    q, qd, _solver = _step_once(model, iterations=1, dt=0.1, plane_projection_iterations=1)
+
+    np.testing.assert_array_equal(q[list(fixed)], rest[list(fixed)])
+    np.testing.assert_array_equal(qd[list(fixed)], np.zeros((len(fixed), 3), dtype=np.float32))
+    np.testing.assert_allclose(q[1:3, 2], radius, rtol=0.0, atol=1.0e-6)
+
+
+def test_fem_plane_projection_disabled_preserves_penetration(test, device):
+    radius = 0.1
+    model = _build_single_tet_model(device, gravity=0.0, pos_z=-0.25, add_ground=True, particle_radius=radius)
+
+    q, qd, _solver = _step_once(model, iterations=1, dt=0.1, plane_projection_iterations=0)
+    rest = model.particle_q.numpy()
+
+    np.testing.assert_allclose(q, rest, rtol=0.0, atol=1.0e-7)
+    np.testing.assert_allclose(qd, np.zeros_like(qd), rtol=0.0, atol=1.0e-7)
+    test.assertLess(q[0, 2], radius)
+
+
+def test_fem_particle_drag_projection_moves_picked_point(test, device):
+    model = _build_single_tet_model(device, gravity=0.0)
+    solver = newton.solvers.SolverFEM(
+        model,
+        iterations=1,
+        cg_tol=1.0e-7,
+        cg_max_iters=128,
+        particle_drag_projection_iterations=1,
+    )
+    target = wp.array([wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.4)], dtype=wp.vec3, device=device)
+    picked_point = wp.zeros(1, dtype=wp.vec3, device=device)
+    solver.set_particle_drag_constraint(
+        wp.array([0, 1, 2], dtype=wp.int32, device=device),
+        wp.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=float, device=device),
+        target,
+        picked_point,
+    )
+
+    state_in = model.state()
+    state_out = model.state()
+    solver.step(state_in, state_out, None, None, 0.1)
+
+    np.testing.assert_allclose(picked_point.numpy()[0], target.numpy()[0], rtol=0.0, atol=1.0e-6)
+    qd = state_out.particle_qd.numpy()
+    test.assertGreater(float(np.linalg.norm(qd[:3])), 0.0)
+
+
+def test_fem_particle_drag_projection_disabled_preserves_state(test, device):
+    model = _build_single_tet_model(device, gravity=0.0)
+    solver = newton.solvers.SolverFEM(model, iterations=1, cg_tol=1.0e-7, cg_max_iters=128)
+    target = wp.array([wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.4)], dtype=wp.vec3, device=device)
+    picked_point = wp.zeros(1, dtype=wp.vec3, device=device)
+    solver.set_particle_drag_constraint(
+        wp.array([0, 1, 2], dtype=wp.int32, device=device),
+        wp.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=float, device=device),
+        target,
+        picked_point,
+    )
+
+    state_in = model.state()
+    state_out = model.state()
+    solver.step(state_in, state_out, None, None, 0.1)
+
+    np.testing.assert_allclose(state_out.particle_q.numpy(), model.particle_q.numpy(), rtol=0.0, atol=1.0e-7)
+    np.testing.assert_allclose(state_out.particle_qd.numpy(), 0.0, rtol=0.0, atol=1.0e-7)
+
+
 devices = get_test_devices(mode="basic")
 add_function_test(TestSolverFEM, "test_fem_rest_stability", test_fem_rest_stability, devices=devices)
 add_function_test(
@@ -152,6 +254,36 @@ add_function_test(
     TestSolverFEM,
     "test_fem_material_refresh_changes_deformation",
     test_fem_material_refresh_changes_deformation,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEM,
+    "test_fem_plane_projection_clamps_ground_penetration",
+    test_fem_plane_projection_clamps_ground_penetration,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEM,
+    "test_fem_plane_projection_preserves_fixed_particles",
+    test_fem_plane_projection_preserves_fixed_particles,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEM,
+    "test_fem_plane_projection_disabled_preserves_penetration",
+    test_fem_plane_projection_disabled_preserves_penetration,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEM,
+    "test_fem_particle_drag_projection_moves_picked_point",
+    test_fem_particle_drag_projection_moves_picked_point,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEM,
+    "test_fem_particle_drag_projection_disabled_preserves_state",
+    test_fem_particle_drag_projection_disabled_preserves_state,
     devices=devices,
 )
 

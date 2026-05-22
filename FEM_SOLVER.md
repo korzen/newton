@@ -22,6 +22,10 @@ The solver currently supports:
   `ParticleFlags.ACTIVE`.
 - External user particle forces, gravity, and existing Newton soft-contact
   force scattering.
+- Optional post-solve position projection for active particles against
+  infinite `GeoType.PLANE` shapes with `ShapeFlags.COLLIDE_PARTICLES`.
+- Optional post-solve mouse-drag projection of a picked soft-body surface
+  point, driven by the viewer's right-click particle picking state.
 - Mass-proportional damping through `k_damp`.
 - Sparse linear solves through Warp BSR matrices and CG with diagonal
   preconditioning.
@@ -126,12 +130,31 @@ Contacts are currently external-force-only:
 - Existing soft contacts are scattered into `f_ext`.
 - Contact stiffness/tangents are not added to the Newton matrix.
 
+`SolverFEM` also has an opt-in floor projection path through
+`plane_contact_projection_iterations`. When enabled, the solver first runs the
+same implicit displacement Newton solve, then projects active dynamic particles
+out of infinite plane shapes and recomputes particle velocities from the
+corrected positions. This v1 projection is normal-only, respects particle/shape
+world filtering, treats plane bodies as kinematic obstacles, and is limited to
+infinite planes such as those created by `ModelBuilder.add_ground_plane()`.
+Finite planes, arbitrary SDF shapes, particle-particle contacts, and friction
+constraints are not projected.
+
+For interactive manipulation, `SolverFEM` can also consume a viewer-provided
+soft pick via `set_particle_drag_constraint()`. The OpenGL viewer raycasts the
+rendered soft-body surface triangles on right-click, stores the selected
+barycentric particle triple and mouse target, and FEM projects that weighted
+point to the target after each implicit solve. This is XPBD-style positional
+dragging: selected particles are moved according to inverse mass and their
+velocities are recomputed from the corrected positions. Rigid body picking keeps
+using the existing force path.
+
 This keeps the implementation simple and demo-oriented, but means contact is
 not fully implicit and can require smaller time steps or more substeps.
 
 ## Public Demo Surface
 
-The public constructor stayed stable:
+The public constructor remains backward-compatible:
 
 - `iterations` now means nonlinear Newton iterations.
 - `cg_tol` and `cg_max_iters` remain the inner linear solve controls.
@@ -145,6 +168,10 @@ uv run -m newton.examples vsd_device --solver fem
 
 FEM mode now defaults to `iterations=4` in that example, while the existing GUI
 iteration control still updates `solver.iterations`.
+It also enables `plane_contact_projection_iterations=1` for hard floor
+non-penetration and `particle_drag_projection_iterations=1` for right-click
+mouse dragging in that demo. General `SolverFEM` users remain on the historical
+FEM-only contact-force behavior unless they opt in to projection features.
 
 ## Tests Added
 
@@ -241,4 +268,3 @@ High-value next steps:
     If it should become a production-facing solver, define the API for meshes,
     materials, contacts, diagnostics, and solver failure handling before adding
     many features.
-

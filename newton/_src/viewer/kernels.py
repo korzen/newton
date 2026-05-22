@@ -152,6 +152,117 @@ def update_pick_target_kernel(
     pick_state[0].picking_target_world = new_mouse_target
 
 
+@wp.func
+def _picking_spinlock_acquire(lock: wp.array[wp.int32]):
+    while wp.atomic_cas(lock, 0, 0, 1) == 1:
+        pass
+
+
+@wp.func
+def _picking_spinlock_release(lock: wp.array[wp.int32]):
+    wp.atomic_exch(lock, 0, 0)
+
+
+@wp.func
+def _ray_intersect_triangle(ray_origin: wp.vec3, ray_direction: wp.vec3, p0: wp.vec3, p1: wp.vec3, p2: wp.vec3):
+    eps = 1.0e-8
+    e1 = p1 - p0
+    e2 = p2 - p0
+    h = wp.cross(ray_direction, e2)
+    a = wp.dot(e1, h)
+    if wp.abs(a) < eps:
+        return -1.0, wp.vec3(0.0, 0.0, 0.0)
+
+    f = 1.0 / a
+    s = ray_origin - p0
+    u = f * wp.dot(s, h)
+    if u < 0.0 or u > 1.0:
+        return -1.0, wp.vec3(0.0, 0.0, 0.0)
+
+    q = wp.cross(s, e1)
+    v = f * wp.dot(ray_direction, q)
+    if v < 0.0 or u + v > 1.0:
+        return -1.0, wp.vec3(0.0, 0.0, 0.0)
+
+    t = f * wp.dot(e2, q)
+    if t < 0.0:
+        return -1.0, wp.vec3(0.0, 0.0, 0.0)
+
+    return t, wp.vec3(1.0 - u - v, u, v)
+
+
+@wp.kernel
+def raycast_particle_triangles_kernel(
+    particle_q: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
+    tri_indices: wp.array2d[wp.int32],
+    ray_origin: wp.vec3,
+    ray_direction: wp.vec3,
+    world_offsets: wp.array[wp.vec3],
+    visible_worlds_mask: wp.array[wp.int32],
+    lock: wp.array[wp.int32],
+    min_dist: wp.array[float],
+    out_particle_indices: wp.array[wp.int32],
+    out_particle_weights: wp.array[float],
+    out_particle_world: wp.array[wp.int32],
+    out_hit_point: wp.array[wp.vec3],
+):
+    tri = wp.tid()
+    i0 = tri_indices[tri, 0]
+    i1 = tri_indices[tri, 1]
+    i2 = tri_indices[tri, 2]
+
+    active0 = (particle_flags[i0] & newton.ParticleFlags.ACTIVE) != 0 and particle_mass[i0] > 0.0
+    active1 = (particle_flags[i1] & newton.ParticleFlags.ACTIVE) != 0 and particle_mass[i1] > 0.0
+    active2 = (particle_flags[i2] & newton.ParticleFlags.ACTIVE) != 0 and particle_mass[i2] > 0.0
+    if not (active0 or active1 or active2):
+        return
+
+    world_id = particle_world[i0]
+    if visible_worlds_mask and world_id >= 0:
+        if visible_worlds_mask[world_id] == 0:
+            return
+
+    p0 = particle_q[i0]
+    p1 = particle_q[i1]
+    p2 = particle_q[i2]
+    offset = wp.vec3(0.0, 0.0, 0.0)
+    if world_offsets and world_id >= 0 and world_id < world_offsets.shape[0]:
+        offset = world_offsets[world_id]
+
+    t, bary = _ray_intersect_triangle(ray_origin, ray_direction, p0 + offset, p1 + offset, p2 + offset)
+    if t < 0.0 or t >= min_dist[0]:
+        return
+
+    _picking_spinlock_acquire(lock)
+    old_min = wp.atomic_min(min_dist, 0, t)
+    if t <= old_min:
+        out_particle_indices[0] = i0
+        out_particle_indices[1] = i1
+        out_particle_indices[2] = i2
+        out_particle_weights[0] = bary[0]
+        out_particle_weights[1] = bary[1]
+        out_particle_weights[2] = bary[2]
+        out_particle_world[0] = world_id
+        out_hit_point[0] = bary[0] * p0 + bary[1] * p1 + bary[2] * p2
+    _picking_spinlock_release(lock)
+
+
+@wp.kernel
+def update_particle_pick_target_kernel(
+    p: wp.vec3,
+    d: wp.vec3,
+    world_offset: wp.vec3,
+    pick_target_world: wp.array[wp.vec3],
+):
+    original_target = pick_target_world[0]
+    original_target_offset = original_target + world_offset
+    dist = wp.length(original_target_offset - p)
+    pick_target_world[0] = p + d * dist - world_offset
+
+
 @wp.kernel
 def update_shape_xforms(
     shape_xforms: wp.array[wp.transform],

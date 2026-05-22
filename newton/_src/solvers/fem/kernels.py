@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from ...geometry import ParticleFlags
+from ...geometry import GeoType, ParticleFlags, ShapeFlags
 
 
 @wp.kernel
@@ -241,3 +241,119 @@ def write_state_outputs(
         particle_qd[tid] = wp.vec3(0.0, 0.0, 0.0)
     else:
         particle_qd[tid] = (u_dofs[tid] - u_n[tid]) / dt
+
+
+@wp.kernel
+def project_particles_against_infinite_planes(
+    particle_q_in: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_radius: wp.array[float],
+    particle_world: wp.array[wp.int32],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_flags: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_count: int,
+    dt: float,
+    relaxation: float,
+):
+    """Project active particles out of infinite plane shapes and update velocity."""
+    tid = wp.tid()
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or particle_mass[tid] == 0.0:
+        particle_qd[tid] = wp.vec3(0.0, 0.0, 0.0)
+        return
+
+    q = particle_q[tid]
+    radius = particle_radius[tid]
+    particle_world_id = particle_world[tid]
+
+    for shape_idx in range(shape_count):
+        if (shape_flags[shape_idx] & ShapeFlags.COLLIDE_PARTICLES) == 0:
+            continue
+        if shape_type[shape_idx] != GeoType.PLANE:
+            continue
+
+        scale = shape_scale[shape_idx]
+        if scale[0] != 0.0 or scale[1] != 0.0:
+            continue
+
+        shape_world_id = shape_world[shape_idx]
+        if particle_world_id != -1 and shape_world_id != -1 and particle_world_id != shape_world_id:
+            continue
+
+        X_ws = shape_transform[shape_idx]
+        body_idx = shape_body[shape_idx]
+        if body_idx >= 0:
+            X_ws = wp.transform_multiply(body_q[body_idx], X_ws)
+
+        plane_point = wp.transform_get_translation(X_ws)
+        normal = wp.normalize(wp.transform_vector(X_ws, wp.vec3(0.0, 0.0, 1.0)))
+        signed_distance = wp.dot(normal, q - plane_point) - radius
+
+        if signed_distance < 0.0:
+            q = q - relaxation * signed_distance * normal
+
+    particle_q[tid] = q
+    particle_qd[tid] = (q - particle_q_in[tid]) / dt
+
+
+@wp.kernel
+def project_particle_drag_constraint(
+    particle_q_in: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    pick_particle_indices: wp.array[wp.int32],
+    pick_particle_weights: wp.array[float],
+    pick_particle_target: wp.array[wp.vec3],
+    pick_particle_point: wp.array[wp.vec3],
+    dt: float,
+    relaxation: float,
+):
+    """XPBD-style projection of a picked particle or surface point to a mouse target."""
+    if pick_particle_indices[0] < 0:
+        return
+
+    picked = wp.vec3(0.0, 0.0, 0.0)
+    denom = float(0.0)
+
+    for k in range(3):
+        i = pick_particle_indices[k]
+        if i < 0:
+            continue
+
+        w = pick_particle_weights[k]
+        picked = picked + w * particle_q[i]
+        if (particle_flags[i] & ParticleFlags.ACTIVE) != 0 and particle_mass[i] > 0.0:
+            denom = denom + w * w / particle_mass[i]
+
+    target = pick_particle_target[0]
+    correction = relaxation * (target - picked)
+
+    if denom > 0.0:
+        for k in range(3):
+            i = pick_particle_indices[k]
+            if i < 0:
+                continue
+            if (particle_flags[i] & ParticleFlags.ACTIVE) == 0 or particle_mass[i] == 0.0:
+                particle_qd[i] = wp.vec3(0.0, 0.0, 0.0)
+                continue
+
+            w = pick_particle_weights[k]
+            q = particle_q[i] + correction * (w / particle_mass[i] / denom)
+            particle_q[i] = q
+            particle_qd[i] = (q - particle_q_in[i]) / dt
+
+    picked_after = wp.vec3(0.0, 0.0, 0.0)
+    for k in range(3):
+        i = pick_particle_indices[k]
+        if i >= 0:
+            picked_after = picked_after + pick_particle_weights[k] * particle_q[i]
+    pick_particle_point[0] = picked_after

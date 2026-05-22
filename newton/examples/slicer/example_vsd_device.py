@@ -115,10 +115,26 @@ class Example:
         self.contacts = self.model.contacts()
 
         self.viewer.set_model(self.model)
+        self._connect_particle_drag_projection()
         if hasattr(self.viewer, "set_camera"):
             self.viewer.set_camera(wp.vec3(1.8, -2.0, 1.1), -18.0, 132.0)
 
         self.capture()
+
+    def _connect_particle_drag_projection(self):
+        if self.solver_type != "fem" or not hasattr(self.solver, "set_particle_drag_constraint"):
+            return
+
+        picking = getattr(self.viewer, "picking", None)
+        if picking is None or not hasattr(picking, "pick_particle_indices"):
+            return
+
+        self.solver.set_particle_drag_constraint(
+            picking.pick_particle_indices,
+            picking.pick_particle_weights,
+            picking.pick_particle_target,
+            picking.pick_particle_point,
+        )
 
     def _create_solver(self):
         if self.solver_type == "vbd":
@@ -133,6 +149,8 @@ class Example:
             return newton.solvers.SolverFEM(
                 model=self.model,
                 iterations=self.iterations,
+                plane_contact_projection_iterations=1,
+                particle_drag_projection_iterations=1,
                 fp64=self.fp64,
             )
 

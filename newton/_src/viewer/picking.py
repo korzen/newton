@@ -7,7 +7,14 @@ import warp as wp
 import newton
 
 from ..geometry import raycast
-from .kernels import PickingState, apply_picking_force_kernel, compute_pick_state_kernel, update_pick_target_kernel
+from .kernels import (
+    PickingState,
+    apply_picking_force_kernel,
+    compute_pick_state_kernel,
+    raycast_particle_triangles_kernel,
+    update_particle_pick_target_kernel,
+    update_pick_target_kernel,
+)
 
 
 class Picking:
@@ -53,11 +60,29 @@ class Picking:
         self._contact_points1 = None
         self._debug = False
 
+        device = model.device if model else wp.get_device()
+
         # picking state
         if model and model.device.is_cuda:
             self.pick_body = wp.array([-1], dtype=int, pinned=True, device=model.device)
         else:
             self.pick_body = wp.array([-1], dtype=int, device="cpu")
+
+        self.pick_particle_indices = wp.array([-1, -1, -1], dtype=wp.int32, device=device)
+        self.pick_particle_weights = wp.zeros(3, dtype=float, device=device)
+        self.pick_particle_world = wp.array([-1], dtype=wp.int32, device=device)
+        self.pick_particle_target = wp.zeros(1, dtype=wp.vec3, device=device)
+        self.pick_particle_point = wp.zeros(1, dtype=wp.vec3, device=device)
+
+        self._ray_particle_indices = wp.array([-1, -1, -1], dtype=wp.int32, device=device)
+        self._ray_particle_weights = wp.zeros(3, dtype=float, device=device)
+        self._ray_particle_world = wp.array([-1], dtype=wp.int32, device=device)
+        self._ray_particle_point = wp.zeros(1, dtype=wp.vec3, device=device)
+        self._ray_particle_dist = wp.array([1.0e10], dtype=float, device=device)
+        self._ray_particle_lock = wp.array([0], dtype=wp.int32, device=device)
+        self._empty_body_q = wp.empty(0, dtype=wp.transform, device=device)
+        self._empty_world_offsets = wp.empty(0, dtype=wp.vec3, device=device)
+        self._empty_visible_worlds_mask = wp.empty(0, dtype=wp.int32, device=device)
 
         pick_state_np = np.empty(1, dtype=PickingState.numpy_dtype())
         pick_state_np[0]["pick_stiffness"] = pick_stiffness
@@ -84,6 +109,8 @@ class Picking:
             state: The simulation state.
         """
         if self.model is None:
+            return
+        if state.body_q is None or state.body_qd is None or state.body_f is None:
             return
 
         # Launch kernel always because of graph capture
@@ -114,6 +141,8 @@ class Picking:
         """
         if model is None:
             return wp.zeros(1, dtype=float)
+        if model.body_count == 0 or model.body_mass is None:
+            return wp.zeros(1, dtype=float, device=model.device)
 
         body_mass_np = model.body_mass.numpy()
         effective = body_mass_np.copy()
@@ -150,11 +179,22 @@ class Picking:
         Returns:
             bool: True if picking is active, False otherwise.
         """
-        return self.picking_active
+        return self.is_body_picking() or self.is_particle_picking()
+
+    def is_body_picking(self) -> bool:
+        """Checks if a rigid body is currently picked."""
+        return self.pick_body.numpy()[0] >= 0
+
+    def is_particle_picking(self) -> bool:
+        """Checks if soft-body particles are currently picked."""
+        return self.pick_particle_indices.numpy()[0] >= 0
 
     def release(self) -> None:
         """Releases the picking."""
         self.pick_body.fill_(-1)
+        self.pick_particle_indices.fill_(-1)
+        self.pick_particle_weights.zero_()
+        self.pick_particle_world.fill_(-1)
         self.picking_active = False
 
     def update(self, ray_start: wp.vec3f, ray_dir: wp.vec3f) -> None:
@@ -170,9 +210,9 @@ class Picking:
         if not self.is_picking():
             return
 
-        # Get the world offset for the picked body
+        # Get the world offset for the picked item.
         world_offset = wp.vec3(0.0, 0.0, 0.0)
-        if self.world_offsets is not None and self.world_offsets.shape[0] > 0:
+        if self.world_offsets is not None and self.world_offsets.shape[0] > 0 and self.is_body_picking():
             # Get the picked body index
             picked_body_idx = self.pick_body.numpy()[0]
             if picked_body_idx >= 0 and self.model.body_world is not None:
@@ -181,6 +221,25 @@ class Picking:
                 if body_world_idx >= 0 and body_world_idx < self.world_offsets.shape[0]:
                     offset_np = self.world_offsets.numpy()[body_world_idx]
                     world_offset = wp.vec3(float(offset_np[0]), float(offset_np[1]), float(offset_np[2]))
+        elif self.world_offsets is not None and self.world_offsets.shape[0] > 0 and self.is_particle_picking():
+            particle_world_idx = self.pick_particle_world.numpy()[0]
+            if particle_world_idx >= 0 and particle_world_idx < self.world_offsets.shape[0]:
+                offset_np = self.world_offsets.numpy()[particle_world_idx]
+                world_offset = wp.vec3(float(offset_np[0]), float(offset_np[1]), float(offset_np[2]))
+
+        if self.is_particle_picking():
+            wp.launch(
+                kernel=update_particle_pick_target_kernel,
+                dim=1,
+                inputs=[
+                    ray_start,
+                    ray_dir,
+                    world_offset,
+                    self.pick_particle_target,
+                ],
+                device=self.model.device,
+            )
+            return
 
         wp.launch(
             kernel=update_pick_target_kernel,
@@ -211,15 +270,13 @@ class Picking:
         p, d = ray_start, ray_dir
 
         num_geoms = self.model.shape_count
-        if num_geoms == 0:
-            return
 
-        if self.min_dist is None:
+        if num_geoms > 0 and self.min_dist is None:
             self.min_dist = wp.array([1.0e10], dtype=float, device=self.model.device)
             self.min_index = wp.array([-1], dtype=int, device=self.model.device)
             self.min_body_index = wp.array([-1], dtype=int, device=self.model.device)
             self.lock = wp.array([0], dtype=wp.int32, device=self.model.device)
-        else:
+        elif num_geoms > 0:
             self.min_dist.fill_(1.0e10)
             self.min_index.fill_(-1)
             self.min_body_index.fill_(-1)
@@ -236,44 +293,60 @@ class Picking:
         else:
             world_offsets = wp.array([], dtype=wp.vec3, device=self.model.device)
 
-        # Pick the lean (no-HFIELD) kernel variant when the scene has no heightfields,
-        # so non-HFIELD scenes don't pay the per-thread HeightfieldData overhead.
-        kernel = raycast.raycast_kernel if self.model.has_heightfields else raycast.raycast_kernel_no_hfield
-        wp.launch(
-            kernel=kernel,
-            dim=num_geoms,
-            inputs=[
-                state.body_q,
-                self.model.shape_body,
-                self.model.shape_transform,
-                self.model.shape_type,
-                self.model.shape_scale,
-                self.model.shape_source_ptr,
-                self.model.shape_heightfield_index,
-                self.model.heightfield_data,
-                self.model.heightfield_elevations,
-                p,
-                d,
-                self.lock,
-            ],
-            outputs=[
-                self.min_dist,
-                self.min_index,
-                self.min_body_index,
-                shape_world,
-                world_offsets,
-                self.visible_worlds_mask,
-            ],
-            device=self.model.device,
-        )
-        wp.synchronize()
+        if num_geoms > 0:
+            body_q = state.body_q if state.body_q is not None else self._empty_body_q
+            # Pick the lean (no-HFIELD) kernel variant when the scene has no heightfields,
+            # so non-HFIELD scenes don't pay the per-thread HeightfieldData overhead.
+            kernel = raycast.raycast_kernel if self.model.has_heightfields else raycast.raycast_kernel_no_hfield
+            wp.launch(
+                kernel=kernel,
+                dim=num_geoms,
+                inputs=[
+                    body_q,
+                    self.model.shape_body,
+                    self.model.shape_transform,
+                    self.model.shape_type,
+                    self.model.shape_scale,
+                    self.model.shape_source_ptr,
+                    self.model.shape_heightfield_index,
+                    self.model.heightfield_data,
+                    self.model.heightfield_elevations,
+                    p,
+                    d,
+                    self.lock,
+                ],
+                outputs=[
+                    self.min_dist,
+                    self.min_index,
+                    self.min_body_index,
+                    shape_world,
+                    world_offsets,
+                    self.visible_worlds_mask,
+                ],
+                device=self.model.device,
+            )
+            wp.synchronize()
 
-        dist = self.min_dist.numpy()[0]
-        index = self.min_index.numpy()[0]
-        body_index = self.min_body_index.numpy()[0]
+        particle_dist = self._pick_particle_surface(state, p, d)
 
-        if dist < 1.0e10 and body_index >= 0:
+        dist = self.min_dist.numpy()[0] if num_geoms > 0 else 1.0e10
+        index = self.min_index.numpy()[0] if num_geoms > 0 else -1
+        body_index = self.min_body_index.numpy()[0] if num_geoms > 0 else -1
+
+        if particle_dist < dist:
+            self.pick_dist = particle_dist
+            self.pick_body.fill_(-1)
+            self.pick_particle_indices.assign(self._ray_particle_indices)
+            self.pick_particle_weights.assign(self._ray_particle_weights)
+            self.pick_particle_world.assign(self._ray_particle_world)
+            self.pick_particle_target.assign(self._ray_particle_point)
+            self.pick_particle_point.assign(self._ray_particle_point)
+
+        elif dist < 1.0e10 and body_index >= 0:
             self.pick_dist = dist
+            self.pick_particle_indices.fill_(-1)
+            self.pick_particle_weights.zero_()
+            self.pick_particle_world.fill_(-1)
 
             # Ensures that the ray direction and start point are vec3f objects
             d = wp.vec3f(d[0], d[1], d[2])
@@ -301,11 +374,59 @@ class Picking:
                 device=self.model.device,
             )
             wp.synchronize()
+        else:
+            self.pick_body.fill_(-1)
+            self.pick_particle_indices.fill_(-1)
+            self.pick_particle_weights.zero_()
+            self.pick_particle_world.fill_(-1)
 
-        self.picking_active = self.pick_body.numpy()[0] >= 0
+        self.picking_active = self.is_picking()
 
         if self._debug:
             if dist < 1.0e10:
                 print("#" * 80)
                 print(f"Hit geom {index} of body {body_index} at distance {dist}")
                 print("#" * 80)
+
+    def _pick_particle_surface(self, state: newton.State, ray_start: wp.vec3f, ray_dir: wp.vec3f) -> float:
+        if state.particle_q is None:
+            return 1.0e10
+        if self.model.tri_count <= 0 or self.model.tri_indices is None:
+            return 1.0e10
+
+        self._ray_particle_dist.fill_(1.0e10)
+        self._ray_particle_indices.fill_(-1)
+        self._ray_particle_weights.zero_()
+        self._ray_particle_world.fill_(-1)
+        self._ray_particle_lock.zero_()
+
+        world_offsets = self.world_offsets if self.world_offsets is not None else self._empty_world_offsets
+        visible_worlds_mask = (
+            self.visible_worlds_mask if self.visible_worlds_mask is not None else self._empty_visible_worlds_mask
+        )
+
+        wp.launch(
+            kernel=raycast_particle_triangles_kernel,
+            dim=self.model.tri_count,
+            inputs=[
+                state.particle_q,
+                self.model.particle_mass,
+                self.model.particle_flags,
+                self.model.particle_world,
+                self.model.tri_indices,
+                ray_start,
+                ray_dir,
+                world_offsets,
+                visible_worlds_mask,
+                self._ray_particle_lock,
+            ],
+            outputs=[
+                self._ray_particle_dist,
+                self._ray_particle_indices,
+                self._ray_particle_weights,
+                self._ray_particle_world,
+                self._ray_particle_point,
+            ],
+            device=self.model.device,
+        )
+        return float(self._ray_particle_dist.numpy()[0])

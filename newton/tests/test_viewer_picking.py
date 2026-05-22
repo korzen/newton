@@ -55,6 +55,31 @@ def _make_model_no_shapes(device=None):
     return builder.finalize(device=device)
 
 
+def _make_single_tet_model(device=None, *, pos_z: float = 0.0, add_ground: bool = False):
+    builder = newton.ModelBuilder(gravity=0.0)
+    if add_ground:
+        builder.add_ground_plane()
+    builder.add_soft_mesh(
+        pos=(0.0, 0.0, pos_z),
+        rot=wp.quat_identity(),
+        scale=1.0,
+        vel=(0.0, 0.0, 0.0),
+        vertices=[
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+        ],
+        indices=[0, 1, 2, 3],
+        density=1000.0,
+        k_mu=1.0e3,
+        k_lambda=1.0e3,
+        k_damp=0.0,
+        particle_radius=0.05,
+    )
+    return builder.finalize(device=device)
+
+
 class TestPickingSetup(unittest.TestCase):
     """Tests for the Picking setup (construction, release, pick, update, apply_force)."""
 
@@ -211,6 +236,37 @@ class TestPickingSetup(unittest.TestCase):
         self.assertIsNotNone(picking_with_offsets.world_offsets)
         self.assertEqual(picking_with_offsets.world_offsets.shape[0], 1)
 
+    def test_pick_soft_surface_triangle(self):
+        """pick() selects barycentric soft-body particles when a surface triangle is hit."""
+        model = _make_single_tet_model(device="cpu")
+        state = model.state()
+        picking = Picking(model)
+
+        picking.pick(state, wp.vec3(0.2, 0.2, 2.0), wp.vec3(0.0, 0.0, -1.0))
+
+        self.assertTrue(picking.is_particle_picking())
+        self.assertFalse(picking.is_body_picking())
+        self.assertTrue(np.all(picking.pick_particle_indices.numpy() >= 0))
+        self.assertAlmostEqual(float(np.sum(picking.pick_particle_weights.numpy())), 1.0, places=6)
+
+        target_before = picking.pick_particle_target.numpy().copy()
+        picking.update(wp.vec3(0.3, 0.2, 2.0), wp.vec3(0.0, 0.0, -1.0))
+        target_after = picking.pick_particle_target.numpy()
+        self.assertGreater(float(np.linalg.norm(target_after - target_before)), 1.0e-4)
+
+        picking._apply_picking_force(state)
+
+    def test_pick_soft_surface_with_static_ground_shape(self):
+        """pick() handles a soft mesh with a static ground shape and no rigid bodies."""
+        model = _make_single_tet_model(device="cpu", pos_z=0.25, add_ground=True)
+        state = model.state()
+        picking = Picking(model)
+
+        picking.pick(state, wp.vec3(0.2, 0.2, 2.0), wp.vec3(0.0, 0.0, -1.0))
+
+        self.assertTrue(picking.is_particle_picking())
+        self.assertFalse(picking.is_body_picking())
+
 
 def test_picking_setup_device(test: TestPickingSetup, device):
     """Picking setup works on the given device (CPU or CUDA)."""
@@ -238,12 +294,32 @@ def test_picking_setup_device(test: TestPickingSetup, device):
     test.assertEqual(picking.pick_body.numpy()[0], -1)
 
 
+def test_soft_particle_picking_device(test: TestPickingSetup, device):
+    """Soft triangle picking works on the given device."""
+    model = _make_single_tet_model(device=device)
+    state = model.state()
+    picking = Picking(model)
+
+    picking.pick(state, wp.vec3(0.2, 0.2, 2.0), wp.vec3(0.0, 0.0, -1.0))
+
+    test.assertTrue(picking.is_particle_picking())
+    test.assertEqual(picking.pick_body.numpy()[0], -1)
+    test.assertTrue(np.all(picking.pick_particle_indices.numpy() >= 0))
+    test.assertAlmostEqual(float(np.sum(picking.pick_particle_weights.numpy())), 1.0, places=6)
+
+
 # Add device-parameterized test
 add_function_test(
     TestPickingSetup,
     "test_picking_setup_device",
     test_picking_setup_device,
     devices=get_test_devices(),
+)
+add_function_test(
+    TestPickingSetup,
+    "test_soft_particle_picking_device",
+    test_soft_particle_picking_device,
+    devices=get_test_devices(mode="basic"),
 )
 
 if __name__ == "__main__":
