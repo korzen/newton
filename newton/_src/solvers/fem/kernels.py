@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import warp as wp
 
+from ...geometry import ParticleFlags
+
 
 @wp.kernel
 def compute_gravity_force(
@@ -129,44 +131,113 @@ def build_mass_blocks(
 
 
 @wp.kernel
-def build_rhs(
-    f_ext: wp.array[wp.vec3],
-    f_int: wp.array[wp.vec3],
+def build_dirichlet_projector_blocks(
     particle_mass: wp.array[float],
-    v_prev: wp.array[wp.vec3],
-    dt: float,
-    rhs: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    projector_blocks: wp.array[wp.mat33],
 ):
-    """Right-hand side of backward-Euler step: M v_prev + dt (f_ext - f_int)."""
+    """Build identity projector blocks for inactive or zero-mass particles."""
     tid = wp.tid()
-    rhs[tid] = particle_mass[tid] * v_prev[tid] + dt * (f_ext[tid] - f_int[tid])
+    fixed = (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or particle_mass[tid] == 0.0
+    value = float(fixed)
+    projector_blocks[tid] = wp.mat33(
+        value, 0.0, 0.0,
+        0.0, value, 0.0,
+        0.0, 0.0, value,
+    )
 
 
 @wp.kernel
-def integrate_displacement(
-    v_new: wp.array[wp.vec3],
+def sync_displacement_state(
+    rest_positions: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    u_n: wp.array[wp.vec3],
+    v_n: wp.array[wp.vec3],
+    u_cur: wp.array[wp.vec3],
+):
+    """Initialize previous and current displacement fields from the input state."""
+    tid = wp.tid()
+    u = particle_q[tid] - rest_positions[tid]
+    u_n[tid] = u
+    v_n[tid] = particle_qd[tid]
+    u_cur[tid] = u
+
+
+@wp.kernel
+def refresh_lame_parameters(
+    tet_materials: wp.array2d[float],
+    use_mu_override: int,
+    mu_override: float,
+    use_lambda_override: int,
+    lambda_override: float,
+    mu_e: wp.array[float],
+    lambda_e: wp.array[float],
+):
+    """Refresh per-element Lamé parameters from model materials or scalar overrides."""
+    tid = wp.tid()
+    if use_mu_override:
+        mu_e[tid] = mu_override
+    else:
+        mu_e[tid] = tet_materials[tid, 0]
+
+    if use_lambda_override:
+        lambda_e[tid] = lambda_override
+    else:
+        lambda_e[tid] = tet_materials[tid, 1]
+
+
+@wp.kernel
+def build_newton_rhs(
+    f_ext: wp.array[wp.vec3],
+    f_int: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    u_cur: wp.array[wp.vec3],
+    u_n: wp.array[wp.vec3],
+    v_n: wp.array[wp.vec3],
     dt: float,
     damping: float,
-    u_dofs: wp.array[wp.vec3],
-    velocity: wp.array[wp.vec3],
+    rhs: wp.array[wp.vec3],
 ):
-    """Apply velocity damping, accumulate displacement, and cache velocity."""
+    """Right-hand side for a backward-Euler displacement Newton increment."""
     tid = wp.tid()
-    factor = wp.max(1.0 - damping * dt, 0.0)
-    v = v_new[tid] * factor
-    velocity[tid] = v
-    u_dofs[tid] = u_dofs[tid] + dt * v
+    m = particle_mass[tid]
+    du_inertial = u_cur[tid] - u_n[tid] - dt * v_n[tid]
+    du_damped = u_cur[tid] - u_n[tid]
+    rhs[tid] = f_ext[tid] - f_int[tid] - (m / (dt * dt)) * du_inertial - (damping * m / dt) * du_damped
+
+
+@wp.kernel
+def accumulate_displacement_delta(
+    delta_u: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    u_dofs: wp.array[wp.vec3],
+):
+    """Accumulate Newton displacement increments, defensively zeroing fixed DOFs."""
+    tid = wp.tid()
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or particle_mass[tid] == 0.0:
+        delta_u[tid] = wp.vec3(0.0, 0.0, 0.0)
+        return
+
+    u_dofs[tid] = u_dofs[tid] + delta_u[tid]
 
 
 @wp.kernel
 def write_state_outputs(
     rest_positions: wp.array[wp.vec3],
     u_dofs: wp.array[wp.vec3],
-    velocity: wp.array[wp.vec3],
+    u_n: wp.array[wp.vec3],
+    particle_mass: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    dt: float,
     particle_q: wp.array[wp.vec3],
     particle_qd: wp.array[wp.vec3],
 ):
-    """Write rest + displacement to particle positions and copy out velocity."""
+    """Write rest + displacement and backward-Euler velocity to particle state."""
     tid = wp.tid()
     particle_q[tid] = rest_positions[tid] + u_dofs[tid]
-    particle_qd[tid] = velocity[tid]
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or particle_mass[tid] == 0.0:
+        particle_qd[tid] = wp.vec3(0.0, 0.0, 0.0)
+    else:
+        particle_qd[tid] = (u_dofs[tid] - u_n[tid]) / dt

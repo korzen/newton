@@ -21,11 +21,14 @@ from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
 from .kernels import (
     add_external_force,
+    accumulate_displacement_delta,
+    build_dirichlet_projector_blocks,
     build_mass_blocks,
-    build_rhs,
+    build_newton_rhs,
     compute_gravity_force,
-    integrate_displacement,
+    refresh_lame_parameters,
     scatter_soft_contact_forces,
+    sync_displacement_state,
     write_state_outputs,
 )
 
@@ -52,10 +55,12 @@ def _neohookean_internal_force_form(
     s: fem.Sample,
     v: fem.Field,
     u_cur: fem.Field,
-    mu: float,
-    lam: float,
+    mu_e: wp.array[float],
+    lambda_e: wp.array[float],
 ):
     """P : grad(v) integrand for the Stable Neo-Hookean PK1 stress."""
+    mu = mu_e[s.element_index]
+    lam = lambda_e[s.element_index]
     F = wp.identity(n=3, dtype=float) + fem.grad(u_cur, s)
     J = wp.determinant(F)
     cof = _cofactor_3x3(F)
@@ -72,10 +77,12 @@ def _neohookean_tangent_form(
     u: fem.Field,
     v: fem.Field,
     u_cur: fem.Field,
-    mu: float,
-    lam: float,
+    mu_e: wp.array[float],
+    lambda_e: wp.array[float],
 ):
     """Gauss-Newton approximation of grad(v) : (d^2 Psi/dF^2 : grad(u))."""
+    mu = mu_e[s.element_index]
+    lam = lambda_e[s.element_index]
     F = wp.identity(n=3, dtype=float) + fem.grad(u_cur, s)
     cof = _cofactor_3x3(F)
     grad_u = fem.grad(u, s)
@@ -86,19 +93,19 @@ def _neohookean_tangent_form(
 
 
 class SolverFEM(SolverBase):
-    """warp.fem-backed implicit FEM solver for volumetric soft bodies.
+    """Experimental warp.fem-backed implicit FEM solver for tet soft bodies.
 
-    Drives Newton's particle state through a backward-Euler step using a 3D
-    Stable Neo-Hookean material (Smith et al. 2018). Element assembly and
-    sparse matrix construction are delegated to :mod:`warp.fem`. Newton's
-    :class:`~newton.Contacts` arrays are consumed for collision response,
-    making the solver a drop-in alternative to
-    :class:`~newton.solvers.SolverVBD` or :class:`~newton.solvers.SolverXPBD`
-    for tet-meshed deformable bodies.
+    Drives Newton's particle state through a displacement-based
+    backward-Euler Newton solve using 3D tet4 Stable Neo-Hookean elements
+    (Smith et al. 2018). Element assembly and sparse matrix construction are
+    delegated to :mod:`warp.fem`. Newton's :class:`~newton.Contacts` arrays
+    are consumed as external soft-contact forces; contact tangents are not
+    included in the Newton matrix.
 
     The solver assumes a single soft mesh whose particles span the entire
     ``model.particle_q`` array (the standard layout produced by
-    :meth:`~newton.ModelBuilder.add_soft_mesh`).
+    :meth:`~newton.ModelBuilder.add_soft_mesh`). It is intended for demos and
+    research prototypes rather than FEBio feature parity.
 
     Args:
         model: The Newton model. Must contain tetrahedral elements
@@ -106,10 +113,10 @@ class SolverFEM(SolverBase):
         iterations: Number of Newton-Raphson iterations per ``step()``.
             With ``iterations=1`` this collapses to a single semi-implicit
             backward-Euler step (the default).
-        k_mu: Override first Lamé parameter μ [Pa]. Defaults to the median
-            of ``model.tet_materials[:, 0]``.
-        k_lambda: Override second Lamé parameter λ [Pa]. Defaults to the
-            median of ``model.tet_materials[:, 1]``.
+        k_mu: Optional scalar override for the first Lamé parameter μ [Pa].
+            Defaults to per-element values from ``model.tet_materials[:, 0]``.
+        k_lambda: Optional scalar override for the second Lamé parameter λ [Pa].
+            Defaults to per-element values from ``model.tet_materials[:, 1]``.
         k_damp: Mass-proportional velocity damping coefficient [1/s].
             Default ``0.0``.
         contact_ke: Soft-contact stiffness [N/m]. Defaults to
@@ -161,7 +168,6 @@ class SolverFEM(SolverBase):
 
         self._mu_override = k_mu
         self._lambda_override = k_lambda
-        self._mu, self._lambda = self._read_lame_from_model()
 
         self._contact_ke = float(contact_ke) if contact_ke is not None else float(model.soft_contact_ke)
         self._contact_kd = float(contact_kd) if contact_kd is not None else float(model.soft_contact_kd)
@@ -189,10 +195,13 @@ class SolverFEM(SolverBase):
             self._u_test = fem.make_test(space=self._u_space, domain=self._domain)
             self._u_trial = fem.make_trial(space=self._u_space, domain=self._domain)
 
-            self._velocity = wp.zeros(self.particle_count, dtype=wp.vec3)
+            self._u_n = wp.zeros(self.particle_count, dtype=wp.vec3)
+            self._v_n = wp.zeros(self.particle_count, dtype=wp.vec3)
+            self._delta_u = wp.zeros(self.particle_count, dtype=wp.vec3)
             self._f_ext = wp.zeros(self.particle_count, dtype=wp.vec3)
             self._rhs = wp.zeros(self.particle_count, dtype=wp.vec3)
-            self._v_new = wp.zeros(self.particle_count, dtype=wp.vec3)
+            self._mu_e = wp.zeros(self.tet_count, dtype=float)
+            self._lambda_e = wp.zeros(self.tet_count, dtype=float)
 
             mass_blocks = wp.zeros(self.particle_count, dtype=wp.mat33)
             wp.launch(
@@ -202,6 +211,11 @@ class SolverFEM(SolverBase):
                 outputs=[mass_blocks],
             )
             self._mass_bsr = wps.bsr_diag(mass_blocks)
+
+            projector_blocks = wp.zeros(self.particle_count, dtype=wp.mat33)
+            self._dirichlet_projector = wps.bsr_diag(projector_blocks)
+
+            self._refresh_material_parameters()
 
         self._axpy_work = wps.bsr_axpy_work_arrays()
 
@@ -230,11 +244,15 @@ class SolverFEM(SolverBase):
         n = self.particle_count
 
         with wp.ScopedDevice(device):
-            # Pull the latest velocity from state_in into our cached buffer.
-            # On the very first step this is zero; afterwards it matches
-            # whatever the previous step wrote.
-            if state_in.particle_qd is not None:
-                wp.copy(self._velocity, state_in.particle_qd)
+            if state_in.particle_q is None or state_in.particle_qd is None:
+                raise ValueError("SolverFEM requires particle positions and velocities in state_in.")
+
+            wp.launch(
+                sync_displacement_state,
+                dim=n,
+                inputs=[self._rest_positions, state_in.particle_q, state_in.particle_qd],
+                outputs=[self._u_n, self._v_n, self._u_field.dof_values],
+            )
 
             # External force = gravity + (optional) user-supplied particle_f
             # + soft-contact response.
@@ -255,66 +273,95 @@ class SolverFEM(SolverBase):
 
             self._apply_soft_contacts(state_in, contacts)
 
-            # Single (or repeated) Newton iteration of backward Euler.
+            wp.launch(
+                build_dirichlet_projector_blocks,
+                dim=n,
+                inputs=[model.particle_mass, model.particle_flags],
+                outputs=[self._dirichlet_projector.values],
+            )
+
+            dt_inv = 1.0 / dt
+            mass_scale = dt_inv * dt_inv + self._k_damp * dt_inv
+
+            # Displacement Newton iterations for backward Euler.
             for _ in range(self.iterations):
                 f_int = fem.integrate(
                     _neohookean_internal_force_form,
                     fields={"v": self._u_test, "u_cur": self._u_field},
-                    values={"mu": self._mu, "lam": self._lambda},
+                    values={"mu_e": self._mu_e, "lambda_e": self._lambda_e},
                     output_dtype=wp.vec3,
                 )
 
                 K = fem.integrate(
                     _neohookean_tangent_form,
                     fields={"u": self._u_trial, "v": self._u_test, "u_cur": self._u_field},
-                    values={"mu": self._mu, "lam": self._lambda},
+                    values={"mu_e": self._mu_e, "lambda_e": self._lambda_e},
                     output_dtype=wp.float32,
                 )
 
-                # System matrix A = M + dt^2 K.
+                # System matrix A = M/dt^2 + k_damp*M/dt + K(u).
                 A = wps.bsr_copy(self._mass_bsr)
-                wps.bsr_axpy(K, A, alpha=dt * dt, beta=1.0, work_arrays=self._axpy_work)
+                wps.bsr_axpy(K, A, alpha=1.0, beta=mass_scale, work_arrays=self._axpy_work)
 
-                # RHS b = M v_prev + dt (f_ext - f_int)
                 wp.launch(
-                    build_rhs,
+                    build_newton_rhs,
                     dim=n,
-                    inputs=[self._f_ext, f_int, model.particle_mass, self._velocity, dt],
+                    inputs=[
+                        self._f_ext,
+                        f_int,
+                        model.particle_mass,
+                        self._u_field.dof_values,
+                        self._u_n,
+                        self._v_n,
+                        dt,
+                        self._k_damp,
+                    ],
                     outputs=[self._rhs],
                 )
 
-                self._v_new.zero_()
+                fem.project_linear_system(
+                    A,
+                    self._rhs,
+                    self._dirichlet_projector,
+                    fixed_value=None,
+                    normalize_projector=False,
+                )
+
+                self._delta_u.zero_()
                 wpla.cg(
                     A,
                     b=self._rhs,
-                    x=self._v_new,
+                    x=self._delta_u,
                     M=wpla.preconditioner(A, "diag"),
                     tol=self._cg_tol,
                     maxiter=self._cg_max_iters,
                 )
 
-                # Cache for the next iteration.
-                wp.copy(self._velocity, self._v_new)
-
-            # Integrate displacement, apply damping, write state outputs.
-            wp.launch(
-                integrate_displacement,
-                dim=n,
-                inputs=[self._v_new, dt, self._k_damp],
-                outputs=[self._u_field.dof_values, self._velocity],
-            )
+                wp.launch(
+                    accumulate_displacement_delta,
+                    dim=n,
+                    inputs=[self._delta_u, model.particle_mass, model.particle_flags],
+                    outputs=[self._u_field.dof_values],
+                )
 
             wp.launch(
                 write_state_outputs,
                 dim=n,
-                inputs=[self._rest_positions, self._u_field.dof_values, self._velocity],
+                inputs=[
+                    self._rest_positions,
+                    self._u_field.dof_values,
+                    self._u_n,
+                    model.particle_mass,
+                    model.particle_flags,
+                    dt,
+                ],
                 outputs=[state_out.particle_q, state_out.particle_qd],
             )
 
     @override
     def notify_model_changed(self, flags: int) -> None:
         if flags & SolverNotifyFlags.SHAPE_PROPERTIES:
-            self._mu, self._lambda = self._read_lame_from_model()
+            self._refresh_material_parameters()
 
     def refresh_material_parameters(self) -> None:
         """Re-read Lamé parameters from ``model.tet_materials``.
@@ -323,24 +370,26 @@ class SolverFEM(SolverBase):
         in place and need the solver to pick up the new values without
         recreating the solver.
         """
-        self._mu, self._lambda = self._read_lame_from_model()
+        self._refresh_material_parameters()
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _read_lame_from_model(self) -> tuple[float, float]:
-        if self._mu_override is not None and self._lambda_override is not None:
-            return float(self._mu_override), float(self._lambda_override)
-
-        tet_mat = self.model.tet_materials.numpy()
-        mu = float(self._mu_override) if self._mu_override is not None else float(np.median(tet_mat[:, 0]))
-        lam = (
-            float(self._lambda_override)
-            if self._lambda_override is not None
-            else float(np.median(tet_mat[:, 1]))
-        )
-        return mu, lam
+    def _refresh_material_parameters(self) -> None:
+        with wp.ScopedDevice(self.model.device):
+            wp.launch(
+                refresh_lame_parameters,
+                dim=self.tet_count,
+                inputs=[
+                    self.model.tet_materials,
+                    int(self._mu_override is not None),
+                    float(self._mu_override) if self._mu_override is not None else 0.0,
+                    int(self._lambda_override is not None),
+                    float(self._lambda_override) if self._lambda_override is not None else 0.0,
+                ],
+                outputs=[self._mu_e, self._lambda_e],
+            )
 
     def _apply_soft_contacts(self, state_in: State, contacts: Contacts | None) -> None:
         if contacts is None:

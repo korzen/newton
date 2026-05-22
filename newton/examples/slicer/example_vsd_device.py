@@ -51,13 +51,13 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_substeps = 8
-        self.iterations = 8
         self.sim_dt = self.frame_dt / self.sim_substeps
         self._needs_graph_recapture = False
 
         if self.solver_type not in {"xpbd", "vbd", "fem"}:
             raise ValueError("The VSD device example only supports the XPBD, VBD, and FEM solvers.")
 
+        self.iterations = 4 if self.solver_type == "fem" else 8
         self.fp64 = bool(getattr(args, "fp64", False))
 
         if self.solver_type == "xpbd":
@@ -132,7 +132,7 @@ class Example:
         if self.solver_type == "fem":
             return newton.solvers.SolverFEM(
                 model=self.model,
-                iterations=1,
+                iterations=self.iterations,
                 fp64=self.fp64,
             )
 

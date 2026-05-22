@@ -64,6 +64,14 @@ Supported Features
      - ❌
      - ❌
      - ❌
+   * - :class:`~newton.solvers.SolverFEM`
+     - Implicit
+     - ❌
+     - ❌
+     - ✅
+     - ❌
+     - 🟨 experimental tet FEM
+     - ❌
    * - :class:`~newton.solvers.SolverKamino`
      - Semi-implicit: Euler, Moreau-Jean
      - ✅ maximal coordinates
