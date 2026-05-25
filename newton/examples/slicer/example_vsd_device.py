@@ -23,6 +23,7 @@ import newton.examples
 from newton.examples.slicer.vtk_loader import load_vtk_unstructured_grid
 
 MESH_PATH = Path(__file__).resolve().parent / "vsd_device" / "mesh3.1.vtk"
+VESSEL_MESH_PATH = Path(__file__).resolve().parent / "anatomy" / "RVOT1_Alterra_vessel.vtk"
 VBD_TET_STIFFNESS_EXPONENT_MIN = 1
 VBD_TET_STIFFNESS_EXPONENT_MAX = 10
 XPBD_TET_STIFFNESS_EXPONENT_MIN = 1
@@ -41,6 +42,25 @@ def load_vtk_unstructured_tet_mesh(path: Path) -> newton.TetMesh:
     that extracts the dataset's ``VTK_TETRA`` cells into a :class:`newton.TetMesh`.
     """
     return load_vtk_unstructured_grid(path).to_tet_mesh()
+
+
+def load_vtk_unstructured_triangle_mesh(path: Path) -> newton.Mesh:
+    """Load triangle geometry from a legacy ASCII VTK unstructured grid.
+
+    Native triangle cells are used directly, while volumetric cells contribute
+    their boundary triangles via
+    :meth:`newton.examples.slicer.vtk_loader.VtkUnstructuredGrid.triangle_indices`.
+    """
+    grid = load_vtk_unstructured_grid(path)
+    triangle_indices = grid.triangle_indices()
+    if triangle_indices.size == 0:
+        raise ValueError(f"No triangle surface could be extracted from '{path}'.")
+
+    return newton.Mesh(
+        vertices=grid.points,
+        indices=triangle_indices.reshape(-1).astype(np.int32),
+        compute_inertia=False,
+    )
 
 
 class Example:
@@ -81,9 +101,20 @@ class Example:
         builder.add_ground_plane()
 
         tet_mesh = load_vtk_unstructured_tet_mesh(MESH_PATH)
+        vessel_mesh = load_vtk_unstructured_triangle_mesh(VESSEL_MESH_PATH)
         self.mesh_scale = 0.05 * float(args.scale)
         ox, oy, oz = (float(v) for v in args.offset)
         self.mesh_pos = wp.vec3(0.0 + ox, 0.0 + oy, 0.45 + oz)
+
+        builder.add_shape_mesh(
+            body=-1,
+            xform=wp.transform(self.mesh_pos, wp.quat_identity()),
+            mesh=vessel_mesh,
+            scale=(self.mesh_scale, self.mesh_scale, self.mesh_scale),
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.0),
+            color=(0.55, 0.18, 0.16),
+            label="rvot_alterra_vessel",
+        )
 
         builder.add_soft_mesh(
             pos=self.mesh_pos,
