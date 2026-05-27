@@ -204,6 +204,7 @@ class SolverFEM(SolverBase):
         device = model.device
         self.particle_count = int(model.particle_count)
         self.tet_count = int(model.tet_count)
+        self._has_dirichlet_constraints = self._check_has_dirichlet_constraints(model)
 
         # Snapshot rest positions from the model (these were written by
         # ModelBuilder.finalize() and currently match state.particle_q before
@@ -301,12 +302,13 @@ class SolverFEM(SolverBase):
 
             self._apply_soft_contacts(state_in, contacts)
 
-            wp.launch(
-                build_dirichlet_projector_blocks,
-                dim=n,
-                inputs=[model.particle_mass, model.particle_flags],
-                outputs=[self._dirichlet_projector.values],
-            )
+            if self._has_dirichlet_constraints:
+                wp.launch(
+                    build_dirichlet_projector_blocks,
+                    dim=n,
+                    inputs=[model.particle_mass, model.particle_flags],
+                    outputs=[self._dirichlet_projector.values],
+                )
 
             dt_inv = 1.0 / dt
             mass_scale = dt_inv * dt_inv + self._k_damp * dt_inv
@@ -347,13 +349,14 @@ class SolverFEM(SolverBase):
                     outputs=[self._rhs],
                 )
 
-                fem.project_linear_system(
-                    A,
-                    self._rhs,
-                    self._dirichlet_projector,
-                    fixed_value=None,
-                    normalize_projector=False,
-                )
+                if self._has_dirichlet_constraints:
+                    fem.project_linear_system(
+                        A,
+                        self._rhs,
+                        self._dirichlet_projector,
+                        fixed_value=None,
+                        normalize_projector=False,
+                    )
 
                 self._delta_u.zero_()
                 wpla.cg(
@@ -363,6 +366,7 @@ class SolverFEM(SolverBase):
                     M=wpla.preconditioner(A, "diag"),
                     tol=self._cg_tol,
                     maxiter=self._cg_max_iters,
+                    check_every=0 if device.is_capturing else 10,
                 )
 
                 wp.launch(
@@ -428,6 +432,13 @@ class SolverFEM(SolverBase):
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_has_dirichlet_constraints(model: newton.Model) -> bool:
+        particle_mass = model.particle_mass.numpy()
+        particle_flags = model.particle_flags.numpy()
+        active = int(newton.ParticleFlags.ACTIVE)
+        return bool(np.any((particle_flags & active) == 0) or np.any(particle_mass == 0.0))
 
     def _refresh_material_parameters(self) -> None:
         with wp.ScopedDevice(self.model.device):

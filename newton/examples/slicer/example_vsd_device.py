@@ -278,14 +278,16 @@ def apply_device_clone_target_forces(
     particle_q: wp.array[wp.vec3],
     particle_qd: wp.array[wp.vec3],
     particle_f: wp.array[wp.vec3],
-    X_ws: wp.transform,
-    scale: wp.vec3,
+    X_ws_buffer: wp.array[wp.transform],
+    scale_buffer: wp.array[wp.vec3],
     stiffness: float,
     damping: float,
     max_force: float,
     dt: float,
 ):
     clone_idx = wp.tid()
+    X_ws = X_ws_buffer[0]
+    scale = scale_buffer[0]
     target = wp.transform_point(X_ws, wp.cw_mul(rest_local_q[clone_idx], scale))
     prev_target = prev_target_q[clone_idx]
     target_q[clone_idx] = target
@@ -503,6 +505,7 @@ class Example:
             max(float(args.vessel_contact_force_color_max), VESSEL_CONTACT_FORCE_COLOR_MAX_MIN),
             VESSEL_CONTACT_FORCE_COLOR_MAX_MAX,
         )
+        self._soft_contact_count_cached = 0
 
         self.iterations = 1
         self.fp64 = bool(getattr(args, "fp64", False))
@@ -621,6 +624,19 @@ class Example:
         self.placement_target_q: wp.array[wp.vec3] | None = None
         self.placement_prev_target_q: wp.array[wp.vec3] | None = None
         self.placement_clone_count = 0
+        self.placement_control_transform = wp.array(
+            [self.device_transform_gizmo.transform],
+            dtype=wp.transform,
+            device=self.model.device,
+        )
+        self.placement_control_scale = wp.array(
+            [self._device_compression_vec3()],
+            dtype=wp.vec3,
+            device=self.model.device,
+        )
+        self._last_placement_control_transform = np.empty(0, dtype=np.float32)
+        self._last_placement_control_scale = np.empty(0, dtype=np.float32)
+        self._sync_placement_control_buffers(force=True)
         self._refresh_placement_clone_buffers()
 
         self.viewer.set_model(self.model)
@@ -666,6 +682,8 @@ class Example:
         if self.interactive_placement_enabled and not self.viewer.is_paused():
             self.device_transform_gizmo.sync_to_particles(self.state_0)
         self._reset_placement_clone_targets()
+        self._sync_placement_control_buffers(force=True)
+        self._mark_graph_recapture()
 
     def _refresh_placement_clone_buffers(self):
         enabled_axes = tuple(axis for axis, enabled in enumerate(self.placement_drive_axes) if enabled)
@@ -690,6 +708,35 @@ class Example:
         self.placement_target_q = wp.zeros(self.placement_clone_count, dtype=wp.vec3, device=self.model.device)
         self.placement_prev_target_q = wp.zeros(self.placement_clone_count, dtype=wp.vec3, device=self.model.device)
         self._reset_placement_clone_targets()
+        self._mark_graph_recapture()
+
+    def _device_compression_vec3(self) -> wp.vec3:
+        return wp.vec3(
+            float(self.device_compression[0]),
+            float(self.device_compression[1]),
+            float(self.device_compression[2]),
+        )
+
+    def _sync_placement_control_buffers(self, *, force: bool = False):
+        current_transform = np.asarray(self.device_transform_gizmo.transform, dtype=np.float32)
+        current_scale = np.asarray(self.device_compression, dtype=np.float32)
+        transform_changed = (
+            force
+            or current_transform.shape != self._last_placement_control_transform.shape
+            or not np.array_equal(current_transform, self._last_placement_control_transform)
+        )
+        scale_changed = (
+            force
+            or current_scale.shape != self._last_placement_control_scale.shape
+            or not np.array_equal(current_scale, self._last_placement_control_scale)
+        )
+
+        if transform_changed:
+            self.placement_control_transform.assign([self.device_transform_gizmo.transform])
+            self._last_placement_control_transform = current_transform.copy()
+        if scale_changed:
+            self.placement_control_scale.assign([self._device_compression_vec3()])
+            self._last_placement_control_scale = current_scale.copy()
 
     def _reset_placement_clone_targets(self):
         self._update_placement_clone_targets(reset_previous=True)
@@ -698,11 +745,7 @@ class Example:
         if self.placement_clone_count == 0:
             return
 
-        scale_vec = wp.vec3(
-            float(self.device_compression[0]),
-            float(self.device_compression[1]),
-            float(self.device_compression[2]),
-        )
+        scale_vec = self._device_compression_vec3()
         wp.launch(
             kernel=update_device_clone_targets,
             dim=self.placement_clone_count,
@@ -721,11 +764,6 @@ class Example:
         if not self._use_interactive_placement() or self.placement_clone_count == 0:
             return
 
-        scale_vec = wp.vec3(
-            float(self.device_compression[0]),
-            float(self.device_compression[1]),
-            float(self.device_compression[2]),
-        )
         wp.launch(
             kernel=apply_device_clone_target_forces,
             dim=self.placement_clone_count,
@@ -737,8 +775,8 @@ class Example:
                 self.state_0.particle_q,
                 self.state_0.particle_qd,
                 self.state_0.particle_f,
-                self.device_transform_gizmo.transform,
-                scale_vec,
+                self.placement_control_transform,
+                self.placement_control_scale,
                 self.placement_clone_stiffness,
                 self.placement_clone_damping,
                 self.placement_max_clone_force,
@@ -774,6 +812,7 @@ class Example:
         self.fem_soft_vessel_contact_enabled = bool(enabled)
         self._set_vessel_particle_collision_enabled(self._use_fem_soft_vessel_contact())
         self._apply_fem_soft_contact_settings()
+        self._mark_graph_recapture()
 
         if not self._use_fem_soft_vessel_contact() and self.vessel_contact_iterations == 0:
             self.vessel_contact_iterations = 1
@@ -803,6 +842,7 @@ class Example:
             self.solver._contact_ke = contact_ke
             self.solver._contact_kd = self.fem_soft_contact_kd
             self.solver._contact_mu = self.fem_soft_contact_mu
+        self._mark_graph_recapture()
 
     def _apply_device_particle_radius(self):
         particle_radius = self.model.particle_radius.numpy()
@@ -861,10 +901,7 @@ class Example:
         self._needs_graph_recapture = True
 
     def capture(self):
-        # The FEM solver assembles BSR matrices and runs an iterative CG
-        # solve with data-dependent residual checks each step; neither is
-        # capturable into a static CUDA graph.
-        if wp.get_device().is_cuda and self.solver_type != "fem":
+        if wp.get_device().is_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
@@ -903,6 +940,9 @@ class Example:
             )
 
     def step(self):
+        if self._interactive_placement_available():
+            self._sync_placement_control_buffers()
+
         if self._needs_graph_recapture:
             self.capture()
 
@@ -1272,6 +1312,7 @@ class Example:
                 max(float(value), PLACEMENT_CLONE_STIFFNESS_MIN),
                 PLACEMENT_CLONE_STIFFNESS_MAX,
             )
+            self._mark_graph_recapture()
 
         changed, value = ui.slider_float(
             "Clone Damping",
@@ -1285,6 +1326,7 @@ class Example:
                 max(float(value), PLACEMENT_CLONE_DAMPING_MIN),
                 PLACEMENT_CLONE_DAMPING_MAX,
             )
+            self._mark_graph_recapture()
 
         changed, value = ui.slider_float(
             "Max Clone Force",
@@ -1298,6 +1340,7 @@ class Example:
                 max(float(value), PLACEMENT_MAX_CLONE_FORCE_MIN),
                 PLACEMENT_MAX_CLONE_FORCE_MAX,
             )
+            self._mark_graph_recapture()
 
         changed, show_targets = ui.checkbox("Clone Targets", self.show_placement_clone_targets)
         if changed:
@@ -1408,6 +1451,7 @@ class Example:
                     max(float(value), FEM_SOFT_CONTACT_MARGIN_MIN),
                     FEM_SOFT_CONTACT_MARGIN_MAX,
                 )
+                self._mark_graph_recapture()
 
             changed, value = ui.slider_int(
                 "Contact Stiffness 10^n",
@@ -1465,8 +1509,9 @@ class Example:
                 )
                 self._apply_fem_soft_contact_settings()
 
-            soft_count = int(self.contacts.soft_contact_count.numpy()[0]) if self.contacts is not None else 0
-            ui.text(f"Soft contacts: {soft_count}")
+            if self.contacts is not None and self.viewer.is_paused():
+                self._soft_contact_count_cached = int(self.contacts.soft_contact_count.numpy()[0])
+            ui.text(f"Soft contacts: {self._soft_contact_count_cached}")
             if soft_contact_disabled and hasattr(ui, "end_disabled"):
                 ui.end_disabled()
             ui.separator()

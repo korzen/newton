@@ -236,6 +236,25 @@ def test_fem_particle_drag_projection_disabled_preserves_state(test, device):
     np.testing.assert_allclose(state_out.particle_qd.numpy(), 0.0, rtol=0.0, atol=1.0e-7)
 
 
+def test_fem_cuda_graph_capture_no_fixed_particles(test, device):
+    device = wp.get_device(device)
+    if not device.is_cuda:
+        test.skipTest("CUDA graph capture requires a CUDA device")
+
+    model = _build_single_tet_model(device, gravity=-9.81)
+    solver = newton.solvers.SolverFEM(model, iterations=1, cg_tol=1.0e-7, cg_max_iters=128)
+    state_in = model.state()
+    state_out = model.state()
+
+    with wp.ScopedCapture(device=device) as capture:
+        solver.step(state_in, state_out, None, None, 0.05)
+    wp.capture_launch(capture.graph)
+
+    q = state_out.particle_q.numpy()
+    test.assertTrue(np.all(np.isfinite(q)))
+    test.assertLess(q[:, 2].min(), model.particle_q.numpy()[:, 2].min())
+
+
 devices = get_test_devices(mode="basic")
 add_function_test(TestSolverFEM, "test_fem_rest_stability", test_fem_rest_stability, devices=devices)
 add_function_test(
@@ -284,6 +303,12 @@ add_function_test(
     TestSolverFEM,
     "test_fem_particle_drag_projection_disabled_preserves_state",
     test_fem_particle_drag_projection_disabled_preserves_state,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEM,
+    "test_fem_cuda_graph_capture_no_fixed_particles",
+    test_fem_cuda_graph_capture_no_fixed_particles,
     devices=devices,
 )
 
