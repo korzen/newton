@@ -9,7 +9,7 @@ import sys
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import warp as wp
@@ -988,6 +988,7 @@ class ViewerBase(ABC):
         translate: Sequence[Axis] | None = None,
         rotate: Sequence[Axis] | None = None,
         snap_to: wp.transform | None = None,
+        space: Literal["world", "local"] = "world",
     ):
         """Log a gizmo GUI element for the given name and transform.
 
@@ -1002,7 +1003,11 @@ class ViewerBase(ABC):
                 to hide all rotation rings.
             snap_to: Optional world transform to snap to when this gizmo is
                 released by the user.
+            space: Handle orientation space. ``"world"`` keeps handles aligned
+                to the world axes; ``"local"`` aligns handles to ``transform``.
         """
+        if space not in {"world", "local"}:
+            raise ValueError("Gizmo space must be 'world' or 'local'.")
         return
 
     @abstractmethod

@@ -405,6 +405,7 @@ class ViewerGL(ViewerBase):
         translate: Sequence[Axis] | None = None,
         rotate: Sequence[Axis] | None = None,
         snap_to: wp.transform | None = None,
+        space: Literal["world", "local"] = "world",
     ):
         """Log or update a transform gizmo for the current frame.
 
@@ -419,7 +420,12 @@ class ViewerGL(ViewerBase):
                 to hide all rotation rings.
             snap_to: Optional world transform to snap to when this gizmo is
                 released by the user.
+            space: Handle orientation space. ``"world"`` keeps handles aligned
+                to the world axes; ``"local"`` aligns handles to ``transform``.
         """
+        if space not in {"world", "local"}:
+            raise ValueError("Gizmo space must be 'world' or 'local'.")
+
         axis_order = (Axis.X, Axis.Y, Axis.Z)
 
         if translate is None:
@@ -439,6 +445,7 @@ class ViewerGL(ViewerBase):
             "snap_to": snap_to,
             "translate": t,
             "rotate": r,
+            "space": space,
         }
 
     @override
@@ -1144,6 +1151,16 @@ class ViewerGL(ViewerBase):
 
         if radii is None:
             radii = wp.full(num_points, 0.1, dtype=wp.float32, device=self.device)
+        elif isinstance(radii, int | float | np.integer | np.floating):
+            radii = wp.full(num_points, float(radii), dtype=wp.float32, device=self.device)
+
+        if isinstance(colors, tuple | list):
+            colors = wp.full(
+                num_points,
+                wp.vec3(float(colors[0]), float(colors[1]), float(colors[2])),
+                dtype=wp.vec3,
+                device=self.device,
+            )
 
         # If a point object is first created/recreated and no colors are provided,
         # initialize to white to avoid uninitialized instance color buffers.
@@ -2230,6 +2247,7 @@ class ViewerGL(ViewerBase):
             snap_to = gizmo_data["snap_to"]
             translate = gizmo_data["translate"]
             rotate = gizmo_data["rotate"]
+            space = gizmo_data["space"]
 
             # Use compound ops when all axes are active (includes plane handles).
             if len(translate) == 3:
@@ -2256,8 +2274,9 @@ class ViewerGL(ViewerBase):
             M_ = m44_to_mat16(M)
 
             op_modified = False
+            mode = giz.MODE.local if space == "local" else giz.MODE.world
             for op in ops:
-                op_modified = safe_bool(giz.manipulate(view_, proj_, op, giz.MODE.world, M_, None, None)) or op_modified
+                op_modified = safe_bool(giz.manipulate(view_, proj_, op, mode, M_, None, None)) or op_modified
 
             any_gizmo_is_using = safe_bool(giz.is_using_any())
             if hasattr(giz, "is_using"):

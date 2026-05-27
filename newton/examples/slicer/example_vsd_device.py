@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -45,6 +46,28 @@ FEM_TET_STIFFNESS_EXPONENT_MAX = 7
 TET_STIFFNESS_MULTIPLIER_MIN = 0.0
 TET_STIFFNESS_MULTIPLIER_MAX = 10.0
 XPBD_DISABLED_TET_COMPLIANCE = 1.0e8
+FEM_SOFT_CONTACT_STIFFNESS_EXPONENT_MIN = 1
+FEM_SOFT_CONTACT_STIFFNESS_EXPONENT_MAX = 8
+FEM_SOFT_CONTACT_STIFFNESS_MULTIPLIER_MIN = 0.0
+FEM_SOFT_CONTACT_STIFFNESS_MULTIPLIER_MAX = 10.0
+FEM_SOFT_CONTACT_DAMPING_MIN = 0.0
+FEM_SOFT_CONTACT_DAMPING_MAX = 500.0
+FEM_SOFT_CONTACT_FRICTION_MIN = 0.0
+FEM_SOFT_CONTACT_FRICTION_MAX = 2.0
+FEM_SOFT_CONTACT_MARGIN_MIN = 0.0
+FEM_SOFT_CONTACT_MARGIN_MAX = 0.1
+DEVICE_PARTICLE_RADIUS_MIN = 0.001
+DEVICE_PARTICLE_RADIUS_MAX = 0.08
+VESSEL_CONTACT_FORCE_COLOR_MAX_MIN = 1.0
+VESSEL_CONTACT_FORCE_COLOR_MAX_MAX = 5000.0
+PLACEMENT_AXIS_BAND_RADIUS_MIN = 0.0
+PLACEMENT_AXIS_BAND_RADIUS_MAX = 0.2
+PLACEMENT_CLONE_STIFFNESS_MIN = 0.0
+PLACEMENT_CLONE_STIFFNESS_MAX = 1000.0
+PLACEMENT_CLONE_DAMPING_MIN = 0.0
+PLACEMENT_CLONE_DAMPING_MAX = 100.0
+PLACEMENT_MAX_CLONE_FORCE_MIN = 0.0
+PLACEMENT_MAX_CLONE_FORCE_MAX = 5000.0
 
 
 def load_vtk_unstructured_tet_mesh(path: Path) -> newton.TetMesh:
@@ -124,6 +147,86 @@ def project_particles_vs_static_tri_mesh(
 
 
 @wp.kernel
+def accumulate_vessel_soft_contact_force_metric(
+    soft_contact_count: wp.array[wp.int32],
+    soft_contact_particle: wp.array[wp.int32],
+    soft_contact_shape: wp.array[wp.int32],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_body_vel: wp.array[wp.vec3],
+    soft_contact_normal: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    vessel_shape_idx: int,
+    ke: float,
+    kd: float,
+    mu: float,
+    force_metric: wp.array[float],
+):
+    tid = wp.tid()
+    if tid >= soft_contact_count[0]:
+        return
+    if soft_contact_shape[tid] != vessel_shape_idx:
+        return
+
+    particle_idx = soft_contact_particle[tid]
+    if particle_idx < 0:
+        return
+
+    bx = soft_contact_body_pos[tid]
+    n = soft_contact_normal[tid]
+    px = particle_q[particle_idx]
+    radius = particle_radius[particle_idx]
+
+    penetration = -(wp.dot(n, px - bx) - radius)
+    if penetration <= 0.0:
+        return
+
+    rel_v = particle_qd[particle_idx] - soft_contact_body_vel[tid]
+    vn = wp.dot(rel_v, n)
+
+    fn_mag = ke * penetration
+    if vn < 0.0:
+        fn_mag = fn_mag - kd * vn
+    if fn_mag < 0.0:
+        fn_mag = 0.0
+
+    vt = rel_v - vn * n
+    f_tangent = -kd * vt
+    f_t_norm = wp.length(f_tangent)
+    f_t_max = mu * fn_mag
+    if f_t_norm > f_t_max and f_t_norm > 0.0:
+        f_tangent = f_tangent * (f_t_max / f_t_norm)
+
+    wp.atomic_add(force_metric, particle_idx, wp.length(fn_mag * n + f_tangent))
+
+
+@wp.kernel
+def colorize_contact_force_metric(
+    force_metric: wp.array[float],
+    color_max: float,
+    marker_radius: float,
+    marker_radii: wp.array[float],
+    marker_colors: wp.array[wp.vec3],
+):
+    particle_idx = wp.tid()
+    force = force_metric[particle_idx]
+    if force <= 0.0 or color_max <= 0.0:
+        marker_radii[particle_idx] = 0.0
+        marker_colors[particle_idx] = wp.vec3(0.0, 0.0, 0.0)
+        return
+
+    t = wp.min(force / color_max, 1.0)
+    if t < 0.5:
+        u = 2.0 * t
+        marker_colors[particle_idx] = wp.vec3(u, 0.25 + 0.75 * u, 1.0 - u)
+    else:
+        u = 2.0 * (t - 0.5)
+        marker_colors[particle_idx] = wp.vec3(1.0, 1.0 - u, 0.0)
+    marker_radii[particle_idx] = marker_radius
+
+
+@wp.kernel
 def apply_particle_transform_delta(
     particle_q: wp.array[wp.vec3],
     particle_qd: wp.array[wp.vec3],
@@ -148,6 +251,60 @@ def apply_particle_rest_shape(
     p_scaled = wp.cw_mul(particle_rest_q[wp.tid()], scale)
     particle_q[particle_idx] = wp.transform_point(X_ws, p_scaled)
     particle_qd[particle_idx] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def update_device_clone_targets(
+    rest_local_q: wp.array[wp.vec3],
+    target_q: wp.array[wp.vec3],
+    prev_target_q: wp.array[wp.vec3],
+    X_ws: wp.transform,
+    scale: wp.vec3,
+    reset_previous: int,
+):
+    clone_idx = wp.tid()
+    target = wp.transform_point(X_ws, wp.cw_mul(rest_local_q[clone_idx], scale))
+    target_q[clone_idx] = target
+    if reset_previous != 0:
+        prev_target_q[clone_idx] = target
+
+
+@wp.kernel
+def apply_device_clone_target_forces(
+    particle_indices: wp.array[wp.int32],
+    rest_local_q: wp.array[wp.vec3],
+    target_q: wp.array[wp.vec3],
+    prev_target_q: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_f: wp.array[wp.vec3],
+    X_ws: wp.transform,
+    scale: wp.vec3,
+    stiffness: float,
+    damping: float,
+    max_force: float,
+    dt: float,
+):
+    clone_idx = wp.tid()
+    target = wp.transform_point(X_ws, wp.cw_mul(rest_local_q[clone_idx], scale))
+    prev_target = prev_target_q[clone_idx]
+    target_q[clone_idx] = target
+
+    target_vel = wp.vec3(0.0, 0.0, 0.0)
+    if dt > 0.0:
+        target_vel = (target - prev_target) / dt
+
+    particle_idx = particle_indices[clone_idx]
+    force = stiffness * (target - particle_q[particle_idx]) + damping * (target_vel - particle_qd[particle_idx])
+
+    force_len = wp.length(force)
+    if max_force <= 0.0:
+        force = wp.vec3(0.0, 0.0, 0.0)
+    elif force_len > max_force and force_len > 0.0:
+        force = force * (max_force / force_len)
+
+    particle_f[particle_idx] = particle_f[particle_idx] + force
+    prev_target_q[clone_idx] = target
 
 
 class StaticTriMeshParticleProjector:
@@ -290,7 +447,64 @@ class Example:
         if self.solver_type not in {"xpbd", "vbd", "fem"}:
             raise ValueError("The VSD device example only supports the XPBD, VBD, and FEM solvers.")
 
-        self.iterations = 4 if self.solver_type == "fem" else 8
+        self.device_gizmo_space = self._validate_device_gizmo_space(getattr(args, "device_gizmo_space", "world"))
+        requested_interactive_placement = bool(getattr(args, "interactive_placement", False))
+        self.interactive_placement_enabled = requested_interactive_placement and self.solver_type == "fem"
+        if requested_interactive_placement and self.solver_type != "fem":
+            print("Interactive placement is available only with --solver fem; ignoring --interactive-placement.")
+        self.placement_drive_axes = self._parse_placement_drive_axes(
+            getattr(args, "placement_drive_axes", ("x", "y", "z"))
+        )
+        self.placement_axis_band_radius = min(
+            max(float(getattr(args, "placement_axis_band_radius", 0.05)), PLACEMENT_AXIS_BAND_RADIUS_MIN),
+            PLACEMENT_AXIS_BAND_RADIUS_MAX,
+        )
+        self.placement_clone_stiffness = min(
+            max(float(getattr(args, "placement_clone_stiffness", 1000.0)), PLACEMENT_CLONE_STIFFNESS_MIN),
+            PLACEMENT_CLONE_STIFFNESS_MAX,
+        )
+        self.placement_clone_damping = min(
+            max(float(getattr(args, "placement_clone_damping", 0.0)), PLACEMENT_CLONE_DAMPING_MIN),
+            PLACEMENT_CLONE_DAMPING_MAX,
+        )
+        self.placement_max_clone_force = min(
+            max(float(getattr(args, "placement_max_clone_force", 1000.0)), PLACEMENT_MAX_CLONE_FORCE_MIN),
+            PLACEMENT_MAX_CLONE_FORCE_MAX,
+        )
+        self.show_placement_clone_targets = True
+
+        self.fem_soft_vessel_contact_enabled = bool(args.fem_soft_vessel_contact)
+        self.fem_soft_contact_stiffness_multiplier = min(
+            max(float(args.fem_soft_contact_stiffness_multiplier), FEM_SOFT_CONTACT_STIFFNESS_MULTIPLIER_MIN),
+            FEM_SOFT_CONTACT_STIFFNESS_MULTIPLIER_MAX,
+        )
+        self.fem_soft_contact_stiffness_exponent = min(
+            max(int(args.fem_soft_contact_stiffness_exponent), FEM_SOFT_CONTACT_STIFFNESS_EXPONENT_MIN),
+            FEM_SOFT_CONTACT_STIFFNESS_EXPONENT_MAX,
+        )
+        self.fem_soft_contact_kd = min(
+            max(float(args.fem_soft_contact_damping), FEM_SOFT_CONTACT_DAMPING_MIN),
+            FEM_SOFT_CONTACT_DAMPING_MAX,
+        )
+        self.fem_soft_contact_mu = min(
+            max(float(args.fem_soft_contact_friction), FEM_SOFT_CONTACT_FRICTION_MIN),
+            FEM_SOFT_CONTACT_FRICTION_MAX,
+        )
+        self.fem_soft_contact_margin = min(
+            max(float(args.fem_soft_contact_margin), FEM_SOFT_CONTACT_MARGIN_MIN),
+            FEM_SOFT_CONTACT_MARGIN_MAX,
+        )
+        self.device_particle_radius = min(
+            max(float(args.device_particle_radius), DEVICE_PARTICLE_RADIUS_MIN),
+            DEVICE_PARTICLE_RADIUS_MAX,
+        )
+        self.show_vessel_contact_markers = bool(args.show_vessel_contact_markers)
+        self.vessel_contact_force_color_max = min(
+            max(float(args.vessel_contact_force_color_max), VESSEL_CONTACT_FORCE_COLOR_MAX_MIN),
+            VESSEL_CONTACT_FORCE_COLOR_MAX_MAX,
+        )
+
+        self.iterations = 1
         self.fp64 = bool(getattr(args, "fp64", False))
 
         if self.solver_type == "xpbd":
@@ -320,7 +534,7 @@ class Example:
         ox, oy, oz = (float(v) for v in args.offset)
         self.mesh_pos = wp.vec3(0.0 + ox, 0.0 + oy, 0.45 + oz)
 
-        builder.add_shape_mesh(
+        self.vessel_shape_idx = builder.add_shape_mesh(
             body=-1,
             xform=wp.transform(self.mesh_pos, wp.quat_identity()),
             mesh=vessel_mesh,
@@ -328,7 +542,10 @@ class Example:
             cfg=newton.ModelBuilder.ShapeConfig(
                 density=0.0,
                 has_shape_collision=False,
-                has_particle_collision=False,
+                has_particle_collision=self._use_fem_soft_vessel_contact(),
+                ke=self._compute_fem_soft_contact_stiffness(),
+                kd=self.fem_soft_contact_kd,
+                mu=self.fem_soft_contact_mu,
             ),
             color=(0.55, 0.18, 0.16),
             label="rvot_alterra_vessel",
@@ -345,7 +562,7 @@ class Example:
             k_mu=self.tet_stiffness,
             k_lambda=self.tet_stiffness,
             k_damp=1.0e-4,
-            particle_radius=0.02,
+            particle_radius=self.device_particle_radius,
         )
         self.device_particle_count = builder.particle_count - self.device_particle_start
 
@@ -353,15 +570,21 @@ class Example:
         builder.color()
 
         self.model = builder.finalize()
-        self.model.soft_contact_ke = 1.0e2
-        self.model.soft_contact_kd = 0
-        self.model.soft_contact_mu = 1.0
+        if self.solver_type == "fem":
+            self.model.soft_contact_ke = self._compute_fem_soft_contact_stiffness()
+            self.model.soft_contact_kd = self.fem_soft_contact_kd
+            self.model.soft_contact_mu = self.fem_soft_contact_mu
+        else:
+            self.model.soft_contact_ke = 1.0e2
+            self.model.soft_contact_kd = 0
+            self.model.soft_contact_mu = 1.0
         self._gravity_default = self.model.gravity.numpy().copy()
         device_particle_q = self.model.particle_q.numpy()[
             self.device_particle_start : self.device_particle_start + self.device_particle_count
         ]
         device_rest_center = np.mean(device_particle_q, axis=0)
         device_rest_local_q = device_particle_q - device_rest_center
+        self.device_rest_local_q_np = np.asarray(device_rest_local_q, dtype=np.float32)
 
         self.vessel_particle_projector = StaticTriMeshParticleProjector(
             mesh=vessel_mesh,
@@ -384,10 +607,26 @@ class Example:
         self.state_1 = self.model.state()
         self.control = self.model.control()
 
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            broad_phase="explicit",
+            soft_contact_margin=self._collision_soft_contact_margin(),
+        )
+        self.contacts = self.collision_pipeline.contacts()
+        self.vessel_contact_force_metric = wp.zeros(self.model.particle_count, dtype=float, device=self.model.device)
+        self.vessel_contact_marker_radii = wp.zeros(self.model.particle_count, dtype=float, device=self.model.device)
+        self.vessel_contact_marker_colors = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.model.device)
+        self.placement_particle_indices: wp.array[wp.int32] | None = None
+        self.placement_rest_local_q: wp.array[wp.vec3] | None = None
+        self.placement_target_q: wp.array[wp.vec3] | None = None
+        self.placement_prev_target_q: wp.array[wp.vec3] | None = None
+        self.placement_clone_count = 0
+        self._refresh_placement_clone_buffers()
 
         self.viewer.set_model(self.model)
         self._connect_particle_drag_projection()
+        self._register_contact_panel()
+        self._register_placement_panel()
         if hasattr(self.viewer, "set_camera"):
             self.viewer.set_camera(wp.vec3(1.8, -2.0, 1.1), -18.0, 132.0)
 
@@ -407,6 +646,170 @@ class Example:
             picking.pick_particle_target,
             picking.pick_particle_point,
         )
+
+    def _register_contact_panel(self):
+        if hasattr(self.viewer, "register_ui_callback"):
+            self.viewer.register_ui_callback(lambda ui, ex=self: ex.contact_gui(ui), position="free")
+
+    def _register_placement_panel(self):
+        if hasattr(self.viewer, "register_ui_callback"):
+            self.viewer.register_ui_callback(lambda ui, ex=self: ex.placement_gui(ui), position="free")
+
+    def _interactive_placement_available(self) -> bool:
+        return self.solver_type == "fem"
+
+    def _use_interactive_placement(self) -> bool:
+        return self._interactive_placement_available() and self.interactive_placement_enabled
+
+    def _set_interactive_placement_enabled(self, enabled: bool):
+        self.interactive_placement_enabled = bool(enabled) and self._interactive_placement_available()
+        if self.interactive_placement_enabled and not self.viewer.is_paused():
+            self.device_transform_gizmo.sync_to_particles(self.state_0)
+        self._reset_placement_clone_targets()
+
+    def _refresh_placement_clone_buffers(self):
+        enabled_axes = tuple(axis for axis, enabled in enumerate(self.placement_drive_axes) if enabled)
+        local_q = self.device_rest_local_q_np
+        radius_sq = self.placement_axis_band_radius * self.placement_axis_band_radius
+        mask = np.zeros(local_q.shape[0], dtype=bool)
+
+        if radius_sq > 0.0:
+            for axis in enabled_axes:
+                other_axes = tuple(i for i in range(3) if i != axis)
+                axis_dist_sq = local_q[:, other_axes[0]] * local_q[:, other_axes[0]]
+                axis_dist_sq += local_q[:, other_axes[1]] * local_q[:, other_axes[1]]
+                mask |= axis_dist_sq <= radius_sq
+
+        local_indices = np.nonzero(mask)[0].astype(np.int32)
+        particle_indices = (local_indices + self.device_particle_start).astype(np.int32)
+        rest_local_q = local_q[local_indices].astype(np.float32, copy=False)
+
+        self.placement_clone_count = int(local_indices.shape[0])
+        self.placement_particle_indices = wp.array(particle_indices, dtype=wp.int32, device=self.model.device)
+        self.placement_rest_local_q = wp.array(rest_local_q, dtype=wp.vec3, device=self.model.device)
+        self.placement_target_q = wp.zeros(self.placement_clone_count, dtype=wp.vec3, device=self.model.device)
+        self.placement_prev_target_q = wp.zeros(self.placement_clone_count, dtype=wp.vec3, device=self.model.device)
+        self._reset_placement_clone_targets()
+
+    def _reset_placement_clone_targets(self):
+        self._update_placement_clone_targets(reset_previous=True)
+
+    def _update_placement_clone_targets(self, reset_previous: bool):
+        if self.placement_clone_count == 0:
+            return
+
+        scale_vec = wp.vec3(
+            float(self.device_compression[0]),
+            float(self.device_compression[1]),
+            float(self.device_compression[2]),
+        )
+        wp.launch(
+            kernel=update_device_clone_targets,
+            dim=self.placement_clone_count,
+            inputs=[
+                self.placement_rest_local_q,
+                self.placement_target_q,
+                self.placement_prev_target_q,
+                self.device_transform_gizmo.transform,
+                scale_vec,
+                int(reset_previous),
+            ],
+            device=self.model.device,
+        )
+
+    def _apply_interactive_placement_forces(self):
+        if not self._use_interactive_placement() or self.placement_clone_count == 0:
+            return
+
+        scale_vec = wp.vec3(
+            float(self.device_compression[0]),
+            float(self.device_compression[1]),
+            float(self.device_compression[2]),
+        )
+        wp.launch(
+            kernel=apply_device_clone_target_forces,
+            dim=self.placement_clone_count,
+            inputs=[
+                self.placement_particle_indices,
+                self.placement_rest_local_q,
+                self.placement_target_q,
+                self.placement_prev_target_q,
+                self.state_0.particle_q,
+                self.state_0.particle_qd,
+                self.state_0.particle_f,
+                self.device_transform_gizmo.transform,
+                scale_vec,
+                self.placement_clone_stiffness,
+                self.placement_clone_damping,
+                self.placement_max_clone_force,
+                self.sim_dt,
+            ],
+            device=self.model.device,
+        )
+
+    def _use_fem_soft_vessel_contact(self) -> bool:
+        return self.solver_type == "fem" and self.fem_soft_vessel_contact_enabled
+
+    def _use_vessel_particle_projection(self) -> bool:
+        return not self._use_fem_soft_vessel_contact() and self.vessel_contact_iterations > 0
+
+    def _compute_fem_soft_contact_stiffness(self) -> float:
+        return self.fem_soft_contact_stiffness_multiplier * 10.0**self.fem_soft_contact_stiffness_exponent
+
+    def _collision_soft_contact_margin(self) -> float:
+        if self._use_fem_soft_vessel_contact():
+            return self.fem_soft_contact_margin
+        return 0.01
+
+    def _set_vessel_particle_collision_enabled(self, enabled: bool):
+        flags = self.model.shape_flags.numpy()
+        particle_collision = int(newton.ShapeFlags.COLLIDE_PARTICLES)
+        if enabled:
+            flags[self.vessel_shape_idx] |= particle_collision
+        else:
+            flags[self.vessel_shape_idx] &= ~particle_collision
+        self.model.shape_flags.assign(flags)
+
+    def _set_fem_soft_vessel_contact_enabled(self, enabled: bool):
+        self.fem_soft_vessel_contact_enabled = bool(enabled)
+        self._set_vessel_particle_collision_enabled(self._use_fem_soft_vessel_contact())
+        self._apply_fem_soft_contact_settings()
+
+        if not self._use_fem_soft_vessel_contact() and self.vessel_contact_iterations == 0:
+            self.vessel_contact_iterations = 1
+            self._mark_graph_recapture()
+
+    def _apply_fem_soft_contact_settings(self):
+        if self.solver_type != "fem":
+            return
+
+        contact_ke = self._compute_fem_soft_contact_stiffness()
+        self.model.soft_contact_ke = contact_ke
+        self.model.soft_contact_kd = self.fem_soft_contact_kd
+        self.model.soft_contact_mu = self.fem_soft_contact_mu
+
+        if self.model.shape_material_ke is not None:
+            shape_ke = self.model.shape_material_ke.numpy()
+            shape_kd = self.model.shape_material_kd.numpy()
+            shape_mu = self.model.shape_material_mu.numpy()
+            shape_ke[self.vessel_shape_idx] = contact_ke
+            shape_kd[self.vessel_shape_idx] = self.fem_soft_contact_kd
+            shape_mu[self.vessel_shape_idx] = self.fem_soft_contact_mu
+            self.model.shape_material_ke.assign(shape_ke)
+            self.model.shape_material_kd.assign(shape_kd)
+            self.model.shape_material_mu.assign(shape_mu)
+
+        if hasattr(self.solver, "_contact_ke"):
+            self.solver._contact_ke = contact_ke
+            self.solver._contact_kd = self.fem_soft_contact_kd
+            self.solver._contact_mu = self.fem_soft_contact_mu
+
+    def _apply_device_particle_radius(self):
+        particle_radius = self.model.particle_radius.numpy()
+        particle_radius[self.device_particle_start : self.device_particle_start + self.device_particle_count] = (
+            self.device_particle_radius
+        )
+        self.model.particle_radius.assign(particle_radius)
 
     def _create_solver(self):
         if self.solver_type == "vbd":
@@ -476,9 +879,15 @@ class Example:
             # apply forces to the model
             self.viewer.apply_forces(self.state_0)
 
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(
+                self.state_0,
+                self.contacts,
+                soft_contact_margin=self._collision_soft_contact_margin(),
+            )
+            self._apply_interactive_placement_forces()
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            self._project_vessel_particle_contacts(self.state_1)
+            if self._use_vessel_particle_projection():
+                self._project_vessel_particle_contacts(self.state_1)
 
             # swap states
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -520,10 +929,87 @@ class Example:
         self._update_device_transform_gizmo()
         self.viewer.begin_frame(self.sim_time)
         if self._should_show_device_transform_gizmo():
-            self.viewer.log_gizmo("vsd_device", self.device_transform_gizmo.transform)
+            self.viewer.log_gizmo(
+                "vsd_device",
+                self.device_transform_gizmo.transform,
+                space=self.device_gizmo_space,
+            )
         self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
+        self._render_vessel_contact_markers()
+        self._render_placement_clone_targets()
         self.viewer.end_frame()
+
+    def _render_vessel_contact_markers(self):
+        marker_name = "/vsd/vessel_contact_markers"
+        if (
+            not self.show_vessel_contact_markers
+            or not self._use_fem_soft_vessel_contact()
+            or self.contacts is None
+            or self.contacts.soft_contact_max <= 0
+        ):
+            self.viewer.log_points(marker_name, points=None, hidden=True)
+            return
+
+        self.vessel_contact_force_metric.zero_()
+        wp.launch(
+            kernel=accumulate_vessel_soft_contact_force_metric,
+            dim=self.contacts.soft_contact_max,
+            inputs=[
+                self.contacts.soft_contact_count,
+                self.contacts.soft_contact_particle,
+                self.contacts.soft_contact_shape,
+                self.contacts.soft_contact_body_pos,
+                self.contacts.soft_contact_body_vel,
+                self.contacts.soft_contact_normal,
+                self.state_0.particle_q,
+                self.state_0.particle_qd,
+                self.model.particle_radius,
+                self.vessel_shape_idx,
+                self._compute_fem_soft_contact_stiffness(),
+                self.fem_soft_contact_kd,
+                self.fem_soft_contact_mu,
+            ],
+            outputs=[self.vessel_contact_force_metric],
+            device=self.model.device,
+        )
+        wp.launch(
+            kernel=colorize_contact_force_metric,
+            dim=self.model.particle_count,
+            inputs=[
+                self.vessel_contact_force_metric,
+                self.vessel_contact_force_color_max,
+                1.35 * self.device_particle_radius,
+            ],
+            outputs=[self.vessel_contact_marker_radii, self.vessel_contact_marker_colors],
+            device=self.model.device,
+        )
+        self.viewer.log_points(
+            marker_name,
+            points=self.state_0.particle_q,
+            radii=self.vessel_contact_marker_radii,
+            colors=self.vessel_contact_marker_colors,
+            hidden=False,
+        )
+
+    def _render_placement_clone_targets(self):
+        marker_name = "/vsd/placement_clone_targets"
+        if (
+            not self.show_placement_clone_targets
+            or not self._use_interactive_placement()
+            or self.placement_clone_count == 0
+        ):
+            self.viewer.log_points(marker_name, points=None, hidden=True)
+            return
+
+        self._update_placement_clone_targets(reset_previous=False)
+        self.viewer.log_points(
+            marker_name,
+            points=self.placement_target_q,
+            radii=max(0.35 * self.device_particle_radius, 0.003),
+            colors=(0.0, 0.85, 1.0),
+            hidden=False,
+        )
 
     def _handle_global_keys(self):
         gravity_down = bool(self.viewer.is_key_down("g"))
@@ -543,7 +1029,7 @@ class Example:
         print(f"Gravity {state}.")
 
     def _should_show_device_transform_gizmo(self) -> bool:
-        return hasattr(self.viewer, "log_gizmo") and self.viewer.is_paused()
+        return hasattr(self.viewer, "log_gizmo") and (self.viewer.is_paused() or self._use_interactive_placement())
 
     def _update_device_transform_gizmo(self):
         paused = self.viewer.is_paused()
@@ -560,7 +1046,27 @@ class Example:
 
         self.device_transform_gizmo.apply_delta_if_changed(self.model, (self.state_0, self.state_1))
         self._handle_pause_device_keys()
+        if self._use_interactive_placement():
+            self._reset_placement_clone_targets()
         self.device_transform_gizmo._was_paused = True
+
+    @staticmethod
+    def _validate_device_gizmo_space(value: str) -> str:
+        space = str(value).lower()
+        if space not in {"world", "local"}:
+            raise ValueError("Device gizmo space must be 'world' or 'local'.")
+        return space
+
+    @staticmethod
+    def _parse_placement_drive_axes(values) -> list[bool]:
+        axis_enabled = [False, False, False]
+        axis_to_index = {"x": 0, "y": 1, "z": 2}
+        for value in values:
+            axis = str(value).lower()
+            if axis not in axis_to_index:
+                raise ValueError("Placement drive axes must be chosen from X, Y, and Z.")
+            axis_enabled[axis_to_index[axis]] = True
+        return axis_enabled
 
     @staticmethod
     def _clamp_device_compression(values) -> np.ndarray:
@@ -692,6 +1198,314 @@ class Example:
 
         return True
 
+    def _placement_gizmo_space_gui(self, ui):
+        ui.text("Gizmo Space")
+        if hasattr(ui, "radio_button"):
+            if ui.radio_button("World##placement_gizmo_space", self.device_gizmo_space == "world"):
+                self.device_gizmo_space = "world"
+            if hasattr(ui, "same_line"):
+                ui.same_line()
+            if ui.radio_button("Local##placement_gizmo_space", self.device_gizmo_space == "local"):
+                self.device_gizmo_space = "local"
+            return
+
+        changed, local_space = ui.checkbox("Local Gizmo Space", self.device_gizmo_space == "local")
+        if changed:
+            self.device_gizmo_space = "local" if local_space else "world"
+
+    def placement_gui(self, ui):
+        if not hasattr(ui, "begin"):
+            return
+
+        ui.set_next_window_pos(ui.ImVec2(700.0, 20.0), ui.Cond_.appearing)
+        ui.set_next_window_size(ui.ImVec2(340.0, 300.0), ui.Cond_.appearing)
+        if not ui.begin("VSD Placement"):
+            ui.end()
+            return
+
+        self._placement_gizmo_space_gui(ui)
+        ui.separator()
+
+        placement_disabled = not self._interactive_placement_available()
+        if placement_disabled and hasattr(ui, "begin_disabled"):
+            ui.begin_disabled()
+
+        changed, enabled = ui.checkbox("Interactive Placement", self.interactive_placement_enabled)
+        if changed:
+            self._set_interactive_placement_enabled(bool(enabled))
+
+        axis_changed = False
+        ui.text("Drive Axes")
+        for axis, label in enumerate(("X", "Y", "Z")):
+            changed, enabled = ui.checkbox(f"{label}##placement_drive_axis_{label}", self.placement_drive_axes[axis])
+            if changed:
+                self.placement_drive_axes[axis] = bool(enabled)
+                axis_changed = True
+            if axis < 2 and hasattr(ui, "same_line"):
+                ui.same_line()
+        if axis_changed:
+            self._refresh_placement_clone_buffers()
+
+        changed, value = ui.slider_float(
+            "Axis Band Radius",
+            self.placement_axis_band_radius,
+            PLACEMENT_AXIS_BAND_RADIUS_MIN,
+            PLACEMENT_AXIS_BAND_RADIUS_MAX,
+            "%.3f",
+        )
+        if changed:
+            self.placement_axis_band_radius = min(
+                max(float(value), PLACEMENT_AXIS_BAND_RADIUS_MIN),
+                PLACEMENT_AXIS_BAND_RADIUS_MAX,
+            )
+            self._refresh_placement_clone_buffers()
+
+        changed, value = ui.slider_float(
+            "Clone Stiffness",
+            self.placement_clone_stiffness,
+            PLACEMENT_CLONE_STIFFNESS_MIN,
+            PLACEMENT_CLONE_STIFFNESS_MAX,
+            "%.0f",
+        )
+        if changed:
+            self.placement_clone_stiffness = min(
+                max(float(value), PLACEMENT_CLONE_STIFFNESS_MIN),
+                PLACEMENT_CLONE_STIFFNESS_MAX,
+            )
+
+        changed, value = ui.slider_float(
+            "Clone Damping",
+            self.placement_clone_damping,
+            PLACEMENT_CLONE_DAMPING_MIN,
+            PLACEMENT_CLONE_DAMPING_MAX,
+            "%.1f",
+        )
+        if changed:
+            self.placement_clone_damping = min(
+                max(float(value), PLACEMENT_CLONE_DAMPING_MIN),
+                PLACEMENT_CLONE_DAMPING_MAX,
+            )
+
+        changed, value = ui.slider_float(
+            "Max Clone Force",
+            self.placement_max_clone_force,
+            PLACEMENT_MAX_CLONE_FORCE_MIN,
+            PLACEMENT_MAX_CLONE_FORCE_MAX,
+            "%.0f",
+        )
+        if changed:
+            self.placement_max_clone_force = min(
+                max(float(value), PLACEMENT_MAX_CLONE_FORCE_MIN),
+                PLACEMENT_MAX_CLONE_FORCE_MAX,
+            )
+
+        changed, show_targets = ui.checkbox("Clone Targets", self.show_placement_clone_targets)
+        if changed:
+            self.show_placement_clone_targets = bool(show_targets)
+
+        ui.text(f"Selected Particles: {self.placement_clone_count}")
+
+        if placement_disabled and hasattr(ui, "end_disabled"):
+            ui.end_disabled()
+        ui.end()
+
+    def _projection_contact_gui(self, ui, disabled: bool):
+        if disabled and hasattr(ui, "begin_disabled"):
+            ui.begin_disabled()
+
+        changed, value = ui.slider_float(
+            "Projection Radius",
+            self.vessel_contact_radius,
+            VESSEL_CONTACT_RADIUS_MIN,
+            VESSEL_CONTACT_RADIUS_MAX,
+            "%.3f",
+        )
+        if changed:
+            self.vessel_contact_radius = min(
+                max(float(value), VESSEL_CONTACT_RADIUS_MIN),
+                VESSEL_CONTACT_RADIUS_MAX,
+            )
+            self._mark_graph_recapture()
+
+        changed, value = ui.slider_float(
+            "Projection Relaxation",
+            self.vessel_contact_relaxation,
+            VESSEL_CONTACT_RELAXATION_MIN,
+            VESSEL_CONTACT_RELAXATION_MAX,
+            "%.2f",
+        )
+        if changed:
+            self.vessel_contact_relaxation = min(
+                max(float(value), VESSEL_CONTACT_RELAXATION_MIN),
+                VESSEL_CONTACT_RELAXATION_MAX,
+            )
+            self._mark_graph_recapture()
+
+        changed, value = ui.slider_int(
+            "Projection Iterations",
+            self.vessel_contact_iterations,
+            VESSEL_CONTACT_ITERATIONS_MIN,
+            VESSEL_CONTACT_ITERATIONS_MAX,
+            "%d",
+        )
+        if changed:
+            self.vessel_contact_iterations = min(
+                max(int(value), VESSEL_CONTACT_ITERATIONS_MIN),
+                VESSEL_CONTACT_ITERATIONS_MAX,
+            )
+            self._mark_graph_recapture()
+
+        if disabled and hasattr(ui, "end_disabled"):
+            ui.end_disabled()
+
+    def _contact_model_gui(self, ui):
+        if self.solver_type != "fem":
+            ui.text("Contact Model: PBD Projection")
+            return
+
+        fem_soft_contact = self._use_fem_soft_vessel_contact()
+        if hasattr(ui, "radio_button"):
+            if ui.radio_button("FEM Soft Contact", fem_soft_contact):
+                self._set_fem_soft_vessel_contact_enabled(True)
+                fem_soft_contact = True
+            if hasattr(ui, "same_line"):
+                ui.same_line()
+            if ui.radio_button("PBD Projection", not fem_soft_contact):
+                self._set_fem_soft_vessel_contact_enabled(False)
+            return
+
+        changed, enabled = ui.checkbox("FEM Soft Contact", self.fem_soft_vessel_contact_enabled)
+        if changed:
+            self._set_fem_soft_vessel_contact_enabled(bool(enabled))
+
+    def contact_gui(self, ui):
+        if not hasattr(ui, "begin"):
+            return
+
+        ui.set_next_window_pos(ui.ImVec2(325.0, 20.0), ui.Cond_.appearing)
+        ui.set_next_window_size(ui.ImVec2(360.0, 390.0), ui.Cond_.appearing)
+        if not ui.begin("VSD Vessel Contact"):
+            ui.end()
+            return
+
+        self._contact_model_gui(ui)
+        ui.separator()
+
+        if self.solver_type == "fem":
+            soft_contact_disabled = not self._use_fem_soft_vessel_contact()
+            if soft_contact_disabled and hasattr(ui, "begin_disabled"):
+                ui.begin_disabled()
+
+            changed, value = ui.slider_float(
+                "Soft Margin",
+                self.fem_soft_contact_margin,
+                FEM_SOFT_CONTACT_MARGIN_MIN,
+                FEM_SOFT_CONTACT_MARGIN_MAX,
+                "%.3f",
+            )
+            if changed:
+                self.fem_soft_contact_margin = min(
+                    max(float(value), FEM_SOFT_CONTACT_MARGIN_MIN),
+                    FEM_SOFT_CONTACT_MARGIN_MAX,
+                )
+
+            changed, value = ui.slider_int(
+                "Contact Stiffness 10^n",
+                self.fem_soft_contact_stiffness_exponent,
+                FEM_SOFT_CONTACT_STIFFNESS_EXPONENT_MIN,
+                FEM_SOFT_CONTACT_STIFFNESS_EXPONENT_MAX,
+                "%d",
+            )
+            if changed:
+                self.fem_soft_contact_stiffness_exponent = min(
+                    max(int(value), FEM_SOFT_CONTACT_STIFFNESS_EXPONENT_MIN),
+                    FEM_SOFT_CONTACT_STIFFNESS_EXPONENT_MAX,
+                )
+                self._apply_fem_soft_contact_settings()
+
+            changed, value = ui.slider_float(
+                "Contact Stiffness Mult",
+                self.fem_soft_contact_stiffness_multiplier,
+                FEM_SOFT_CONTACT_STIFFNESS_MULTIPLIER_MIN,
+                FEM_SOFT_CONTACT_STIFFNESS_MULTIPLIER_MAX,
+                "%.2f",
+            )
+            if changed:
+                self.fem_soft_contact_stiffness_multiplier = min(
+                    max(float(value), FEM_SOFT_CONTACT_STIFFNESS_MULTIPLIER_MIN),
+                    FEM_SOFT_CONTACT_STIFFNESS_MULTIPLIER_MAX,
+                )
+                self._apply_fem_soft_contact_settings()
+
+            changed, value = ui.slider_float(
+                "Contact Damping",
+                self.fem_soft_contact_kd,
+                FEM_SOFT_CONTACT_DAMPING_MIN,
+                FEM_SOFT_CONTACT_DAMPING_MAX,
+                "%.1f",
+            )
+            if changed:
+                self.fem_soft_contact_kd = min(
+                    max(float(value), FEM_SOFT_CONTACT_DAMPING_MIN),
+                    FEM_SOFT_CONTACT_DAMPING_MAX,
+                )
+                self._apply_fem_soft_contact_settings()
+
+            changed, value = ui.slider_float(
+                "Contact Friction",
+                self.fem_soft_contact_mu,
+                FEM_SOFT_CONTACT_FRICTION_MIN,
+                FEM_SOFT_CONTACT_FRICTION_MAX,
+                "%.2f",
+            )
+            if changed:
+                self.fem_soft_contact_mu = min(
+                    max(float(value), FEM_SOFT_CONTACT_FRICTION_MIN),
+                    FEM_SOFT_CONTACT_FRICTION_MAX,
+                )
+                self._apply_fem_soft_contact_settings()
+
+            soft_count = int(self.contacts.soft_contact_count.numpy()[0]) if self.contacts is not None else 0
+            ui.text(f"Soft contacts: {soft_count}")
+            if soft_contact_disabled and hasattr(ui, "end_disabled"):
+                ui.end_disabled()
+            ui.separator()
+
+        changed, value = ui.slider_float(
+            "Device Particle Radius",
+            self.device_particle_radius,
+            DEVICE_PARTICLE_RADIUS_MIN,
+            DEVICE_PARTICLE_RADIUS_MAX,
+            "%.3f",
+        )
+        if changed:
+            self.device_particle_radius = min(
+                max(float(value), DEVICE_PARTICLE_RADIUS_MIN),
+                DEVICE_PARTICLE_RADIUS_MAX,
+            )
+            self._apply_device_particle_radius()
+
+        changed, show_markers = ui.checkbox("Contact Markers", self.show_vessel_contact_markers)
+        if changed:
+            self.show_vessel_contact_markers = bool(show_markers)
+
+        changed, value = ui.slider_float(
+            "Marker Force Max",
+            self.vessel_contact_force_color_max,
+            VESSEL_CONTACT_FORCE_COLOR_MAX_MIN,
+            VESSEL_CONTACT_FORCE_COLOR_MAX_MAX,
+            "%.0f",
+        )
+        if changed:
+            self.vessel_contact_force_color_max = min(
+                max(float(value), VESSEL_CONTACT_FORCE_COLOR_MAX_MIN),
+                VESSEL_CONTACT_FORCE_COLOR_MAX_MAX,
+            )
+
+        ui.separator()
+        self._projection_contact_gui(ui, disabled=self._use_fem_soft_vessel_contact())
+        ui.end()
+
     def gui(self, ui):
         changed, value = ui.slider_int("Substeps", self.sim_substeps, 1, 32, "%d")
         if changed:
@@ -723,48 +1537,6 @@ class Example:
             self._apply_tet_stiffness()
             self._mark_graph_recapture()
 
-        changed, value = ui.slider_float(
-            "Vessel Contact Radius",
-            self.vessel_contact_radius,
-            VESSEL_CONTACT_RADIUS_MIN,
-            VESSEL_CONTACT_RADIUS_MAX,
-            "%.3f",
-        )
-        if changed:
-            self.vessel_contact_radius = min(
-                max(float(value), VESSEL_CONTACT_RADIUS_MIN),
-                VESSEL_CONTACT_RADIUS_MAX,
-            )
-            self._mark_graph_recapture()
-
-        changed, value = ui.slider_float(
-            "Vessel Contact Relaxation",
-            self.vessel_contact_relaxation,
-            VESSEL_CONTACT_RELAXATION_MIN,
-            VESSEL_CONTACT_RELAXATION_MAX,
-            "%.2f",
-        )
-        if changed:
-            self.vessel_contact_relaxation = min(
-                max(float(value), VESSEL_CONTACT_RELAXATION_MIN),
-                VESSEL_CONTACT_RELAXATION_MAX,
-            )
-            self._mark_graph_recapture()
-
-        changed, value = ui.slider_int(
-            "Vessel Contact Iterations",
-            self.vessel_contact_iterations,
-            VESSEL_CONTACT_ITERATIONS_MIN,
-            VESSEL_CONTACT_ITERATIONS_MAX,
-            "%d",
-        )
-        if changed:
-            self.vessel_contact_iterations = min(
-                max(int(value), VESSEL_CONTACT_ITERATIONS_MIN),
-                VESSEL_CONTACT_ITERATIONS_MAX,
-            )
-            self._mark_graph_recapture()
-
         for axis, label in enumerate(("X", "Y", "Z")):
             changed, value = ui.slider_float(
                 f"Device Compression {label}",
@@ -779,6 +1551,7 @@ class Example:
                     DEVICE_COMPRESSION_SCALE_MAX,
                 )
                 self.device_transform_gizmo.set_scale(self.device_compression)
+                self._reset_placement_clone_targets()
 
         changed, value = ui.slider_float(
             "Stiffness Multiplier",
@@ -847,6 +1620,105 @@ class Example:
             help="Number of particle-triangle projection passes after each solver substep.",
             type=int,
             default=2,
+        )
+        parser.add_argument(
+            "--fem-soft-vessel-contact",
+            help="Enable FEM soft particle-shape contacts against the vessel mesh.",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        parser.add_argument(
+            "--fem-soft-contact-margin",
+            help="FEM soft-contact detection margin [m] for particle-shape contacts.",
+            type=float,
+            default=0.03,
+        )
+        parser.add_argument(
+            "--fem-soft-contact-stiffness-exponent",
+            help="Exponent n for FEM soft-contact stiffness 10^n [N/m].",
+            type=int,
+            default=3,
+        )
+        parser.add_argument(
+            "--fem-soft-contact-stiffness-multiplier",
+            help="Multiplier for FEM soft-contact stiffness.",
+            type=float,
+            default=1.0,
+        )
+        parser.add_argument(
+            "--fem-soft-contact-damping",
+            help="FEM soft-contact damping [N*s/m].",
+            type=float,
+            default=0.0,
+        )
+        parser.add_argument(
+            "--fem-soft-contact-friction",
+            help="FEM soft-contact Coulomb friction coefficient.",
+            type=float,
+            default=0.4,
+        )
+        parser.add_argument(
+            "--device-particle-radius",
+            help="VSD device particle contact/render radius [m].",
+            type=float,
+            default=0.02,
+        )
+        parser.add_argument(
+            "--show-vessel-contact-markers",
+            help="Show per-particle vessel contact force markers.",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        parser.add_argument(
+            "--vessel-contact-force-color-max",
+            help="Force magnitude [N] mapped to the hottest vessel contact marker color.",
+            type=float,
+            default=1000.0,
+        )
+        parser.add_argument(
+            "--device-gizmo-space",
+            help="Handle orientation space for the VSD transform gizmo.",
+            type=str,
+            choices=["world", "local"],
+            default="world",
+        )
+        parser.add_argument(
+            "--interactive-placement",
+            help="Drive FEM device particles with soft transform-gizmo clone targets.",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
+        parser.add_argument(
+            "--placement-drive-axes",
+            help="Local device axes used to select interactive placement particles.",
+            type=str,
+            nargs="*",
+            metavar="AXIS",
+            default=["x", "y", "z"],
+        )
+        parser.add_argument(
+            "--placement-axis-band-radius",
+            help="Local-axis selection band radius [m] for interactive placement particles.",
+            type=float,
+            default=0.05,
+        )
+        parser.add_argument(
+            "--placement-clone-stiffness",
+            help="Interactive placement clone spring stiffness [N/m].",
+            type=float,
+            default=1000.0,
+        )
+        parser.add_argument(
+            "--placement-clone-damping",
+            help="Interactive placement clone damping [N*s/m].",
+            type=float,
+            default=0.0,
+        )
+        parser.add_argument(
+            "--placement-max-clone-force",
+            help="Maximum force [N] applied by each interactive placement clone.",
+            type=float,
+            default=1000.0,
         )
         parser.add_argument(
             "--device-compression",
