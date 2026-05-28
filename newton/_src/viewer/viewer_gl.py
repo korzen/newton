@@ -735,9 +735,11 @@ class ViewerGL(ViewerBase):
         texture: np.ndarray | str | None = None,
         hidden: bool = False,
         backface_culling: bool = True,
-        color: tuple[float, float, float] | None = None,
+        color: tuple[float, float, float] | tuple[float, float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        vertex_colors: wp.array[wp.vec4] | None = None,
+        transparent: bool | None = None,
     ):
         """
         Log a mesh for rendering.
@@ -751,29 +753,34 @@ class ViewerGL(ViewerBase):
             texture: Texture path/URL or image array (H, W, C).
             hidden: Whether the mesh is hidden.
             backface_culling: Enable backface culling.
-            color: Optional base color as an RGB tuple with values in
+            color: Optional base color as an RGB or RGBA tuple with values in
                 [0, 1]. Used when no texture is provided.
             roughness: Surface roughness in ``[0, 1]``. ``0`` is perfectly
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            vertex_colors: Optional per-vertex RGBA color multipliers.
+            transparent: Optional override for transparent rendering.
         """
         assert isinstance(points, wp.array)
         assert isinstance(indices, wp.array)
         assert normals is None or isinstance(normals, wp.array)
         assert uvs is None or isinstance(uvs, wp.array)
+        assert vertex_colors is None or isinstance(vertex_colors, wp.array)
 
         if name not in self.objects:
             self.objects[name] = MeshGL(
                 len(points), len(indices), self.device, hidden=hidden, backface_culling=backface_culling
             )
 
-        self.objects[name].update(points, indices, normals, uvs, texture)
+        self.objects[name].update(points, indices, normals, uvs, texture, vertex_colors)
         self.objects[name].hidden = hidden
         self.objects[name].backface_culling = backface_culling
+        self.objects[name].transparent_override = transparent
 
         if color is not None:
-            self.objects[name].color = (float(color[0]), float(color[1]), float(color[2]))
+            alpha = float(color[3]) if len(color) > 3 else 1.0
+            self.objects[name].color = (float(color[0]), float(color[1]), float(color[2]), alpha)
 
         if roughness is not None or metallic is not None:
             r, m, c, t = self.objects[name].material

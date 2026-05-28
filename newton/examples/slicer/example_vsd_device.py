@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -22,11 +23,12 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.slicer.vtk_loader import load_vtk_unstructured_grid
+from newton.examples.slicer.vtk_loader import load_vtk_polydata, load_vtk_unstructured_grid
 
 PARTICLE_ACTIVE = wp.constant(int(newton.ParticleFlags.ACTIVE))
 MESH_PATH = Path(__file__).resolve().parent / "vsd_device" / "mesh3.1.vtk"
-VESSEL_MESH_PATH = Path(__file__).resolve().parent / "anatomy" / "RVOT1_Alterra_vessel.vtk"
+# VESSEL_MESH_PATH = Path(__file__).resolve().parent / "anatomy" / "RVOT1_Alterra_vessel.vtk"
+VESSEL_MESH_PATH = Path(__file__).resolve().parent / "anatomy" / "VSD from LV.vtk"
 DEFAULT_DEVICE_POSE_SLOTS_PATH = Path.home() / ".cache" / "newton" / "vsd_device_pose_slots.json"
 VESSEL_CONTACT_RADIUS_MIN = 0.0
 VESSEL_CONTACT_RADIUS_MAX = 0.2
@@ -60,6 +62,20 @@ DEVICE_PARTICLE_RADIUS_MIN = 0.001
 DEVICE_PARTICLE_RADIUS_MAX = 0.08
 VESSEL_CONTACT_FORCE_COLOR_MAX_MIN = 1.0
 VESSEL_CONTACT_FORCE_COLOR_MAX_MAX = 5000.0
+VESSEL_CONTACT_FORCE_COLOR_MULTIPLIER_MIN = 0.0
+VESSEL_CONTACT_FORCE_COLOR_MULTIPLIER_MAX = 100.0
+VESSEL_ALPHA_MIN = 0.0
+VESSEL_ALPHA_MAX = 1.0
+VESSEL_BASE_COLOR = (0.55, 0.55, 0.55)
+VSD_ALPHA_MIN = 0.0
+VSD_ALPHA_MAX = 1.0
+VSD_CONTACT_FORCE_COLOR_MULTIPLIER_MIN = 0.0
+VSD_CONTACT_FORCE_COLOR_MULTIPLIER_MAX = 100.0
+VSD_BASE_COLOR = (0.7, 0.6, 0.4)
+CONTACT_COLOR_SMOOTHING_PASSES_MIN = 0
+CONTACT_COLOR_SMOOTHING_PASSES_MAX = 8
+CONTACT_COLOR_SMOOTHING_STRENGTH_MIN = 0.0
+CONTACT_COLOR_SMOOTHING_STRENGTH_MAX = 1.0
 PLACEMENT_AXIS_BAND_RADIUS_MIN = 0.0
 PLACEMENT_AXIS_BAND_RADIUS_MAX = 0.2
 PLACEMENT_CLONE_STIFFNESS_MIN = 0.0
@@ -68,6 +84,14 @@ PLACEMENT_CLONE_DAMPING_MIN = 0.0
 PLACEMENT_CLONE_DAMPING_MAX = 100.0
 PLACEMENT_MAX_CLONE_FORCE_MIN = 0.0
 PLACEMENT_MAX_CLONE_FORCE_MAX = 5000.0
+MINIMOU_WORKSPACE_SCALE_MIN = 0.01
+MINIMOU_WORKSPACE_SCALE_MAX = 1.0
+MINIMOU_POSITION_OFFSET_SPEED = 0.005
+MINIMOU_ROTATION_OFFSET_SPEED_DEG = 0.5
+MINIMOU_DEVICE_FRAME_AXIS_LENGTH = 0.5
+WORLD_ORIGIN_AXIS_LENGTH = 0.3
+WORLD_ORIGIN_AXIS_THICKNESS = 0.008
+WORLD_ORIGIN_CUBE_HALF_EXTENT = 0.018
 
 
 def load_vtk_unstructured_tet_mesh(path: Path) -> newton.TetMesh:
@@ -79,23 +103,128 @@ def load_vtk_unstructured_tet_mesh(path: Path) -> newton.TetMesh:
     return load_vtk_unstructured_grid(path).to_tet_mesh()
 
 
-def load_vtk_unstructured_triangle_mesh(path: Path) -> newton.Mesh:
-    """Load triangle geometry from a legacy ASCII VTK unstructured grid.
+def load_vtk_triangle_mesh(path: Path) -> newton.Mesh:
+    """Load triangle geometry from a legacy ASCII VTK surface-capable dataset.
 
-    Native triangle cells are used directly, while volumetric cells contribute
-    their boundary triangles via
-    :meth:`newton.examples.slicer.vtk_loader.VtkUnstructuredGrid.triangle_indices`.
+    Supports ``UNSTRUCTURED_GRID`` files by extracting native triangles and
+    volumetric boundary triangles, and ``POLYDATA`` files by triangulating
+    polygonal surface data.
     """
+    dataset_type = read_vtk_dataset_type(path)
+    if dataset_type == "POLYDATA":
+        return load_vtk_polydata(path).to_mesh()
+    if dataset_type != "UNSTRUCTURED_GRID":
+        raise ValueError(f"Expected DATASET UNSTRUCTURED_GRID or POLYDATA in '{path}', got {dataset_type!r}.")
+
     grid = load_vtk_unstructured_grid(path)
     triangle_indices = grid.triangle_indices()
     if triangle_indices.size == 0:
         raise ValueError(f"No triangle surface could be extracted from '{path}'.")
-
     return newton.Mesh(
         vertices=grid.points,
         indices=triangle_indices.reshape(-1).astype(np.int32),
         compute_inertia=False,
     )
+
+
+def read_vtk_dataset_type(path: Path) -> str:
+    """Read the legacy VTK DATASET type without parsing the full file."""
+    with path.open(encoding="utf-8") as file:
+        for line in file:
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0].upper() == "DATASET":
+                return parts[1].upper()
+    raise ValueError(f"VTK file '{path}' is missing the DATASET line.")
+
+
+def compute_triangle_vertex_normals(vertices: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    """Compute area-independent vertex normals for triangle rendering."""
+    triangles = indices.reshape(-1, 3)
+    normals = np.zeros_like(vertices, dtype=np.float32)
+    tri_vertices = vertices[triangles]
+    face_normals = np.cross(tri_vertices[:, 1] - tri_vertices[:, 0], tri_vertices[:, 2] - tri_vertices[:, 0])
+    face_lengths = np.linalg.norm(face_normals, axis=1)
+    valid_faces = face_lengths > 1.0e-12
+    face_normals[valid_faces] /= face_lengths[valid_faces, None]
+
+    for corner in range(3):
+        np.add.at(normals, triangles[:, corner], face_normals)
+
+    normal_lengths = np.linalg.norm(normals, axis=1)
+    valid_vertices = normal_lengths > 1.0e-12
+    normals[valid_vertices] /= normal_lengths[valid_vertices, None]
+    normals[~valid_vertices] = np.array((0.0, 0.0, 1.0), dtype=np.float32)
+    return normals
+
+
+def build_triangle_vertex_adjacency(indices: np.ndarray, vertex_count: int) -> tuple[np.ndarray, np.ndarray]:
+    """Build compact vertex-neighbor lists from triangle indices."""
+    triangles = np.asarray(indices, dtype=np.int32).reshape(-1, 3)
+    if vertex_count <= 0 or triangles.size == 0:
+        return np.zeros(1, dtype=np.int32), np.empty(0, dtype=np.int32)
+
+    directed_edges = np.empty((triangles.shape[0] * 6, 2), dtype=np.int32)
+    directed_edges[0::6] = triangles[:, (0, 1)]
+    directed_edges[1::6] = triangles[:, (0, 2)]
+    directed_edges[2::6] = triangles[:, (1, 0)]
+    directed_edges[3::6] = triangles[:, (1, 2)]
+    directed_edges[4::6] = triangles[:, (2, 0)]
+    directed_edges[5::6] = triangles[:, (2, 1)]
+
+    order = np.lexsort((directed_edges[:, 1], directed_edges[:, 0]))
+    directed_edges = directed_edges[order]
+    unique = np.empty(directed_edges.shape[0], dtype=bool)
+    unique[0] = True
+    unique[1:] = np.any(directed_edges[1:] != directed_edges[:-1], axis=1)
+    directed_edges = directed_edges[unique]
+
+    counts = np.bincount(directed_edges[:, 0], minlength=vertex_count).astype(np.int32, copy=False)
+    offsets = np.empty(vertex_count + 1, dtype=np.int32)
+    offsets[0] = 0
+    np.cumsum(counts, out=offsets[1:])
+
+    return offsets, directed_edges[:, 1].astype(np.int32, copy=False)
+
+
+def normalize_quat_xyzw(quaternion) -> np.ndarray:
+    values = np.asarray(quaternion, dtype=np.float32)
+    if values.shape != (4,):
+        return np.array((0.0, 0.0, 0.0, 1.0), dtype=np.float32)
+
+    norm = float(np.linalg.norm(values))
+    if norm < 1.0e-8 or not math.isfinite(norm):
+        return np.array((0.0, 0.0, 0.0, 1.0), dtype=np.float32)
+
+    values = values / norm
+    if values[3] < 0.0:
+        values = -values
+    return values
+
+
+def quat_mul_xyzw(left, right) -> np.ndarray:
+    lx, ly, lz, lw = normalize_quat_xyzw(left)
+    rx, ry, rz, rw = normalize_quat_xyzw(right)
+    return normalize_quat_xyzw(
+        (
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        )
+    )
+
+
+def quat_inverse_xyzw(quaternion) -> np.ndarray:
+    x, y, z, w = normalize_quat_xyzw(quaternion)
+    return np.array((-x, -y, -z, w), dtype=np.float32)
+
+
+def quat_rotate_xyzw(quaternion, vector) -> np.ndarray:
+    q = normalize_quat_xyzw(quaternion)
+    v = np.asarray(vector, dtype=np.float32)
+    q_vec = q[:3]
+    t = 2.0 * np.cross(q_vec, v)
+    return v + q[3] * t + np.cross(q_vec, t)
 
 
 @wp.kernel
@@ -108,6 +237,8 @@ def project_particles_vs_static_tri_mesh(
     contact_radius: float,
     relaxation: float,
     dt: float,
+    particle_force_metric: wp.array[float],
+    vertex_force_metric: wp.array[float],
 ):
     particle_idx = wp.tid()
     if contact_radius <= 0.0 or relaxation <= 0.0 or dt <= 0.0:
@@ -144,6 +275,16 @@ def project_particles_vs_static_tri_mesh(
     correction = normal * (penetration * relaxation)
     particle_q[particle_idx] = x + correction
     particle_qd[particle_idx] = particle_qd[particle_idx] + correction / dt
+
+    force = penetration * relaxation / (particle_inv_mass[particle_idx] * dt * dt)
+    wp.atomic_add(particle_force_metric, particle_idx, force)
+
+    i0 = wp.mesh_get_index(mesh_id, query.face * 3 + 0)
+    i1 = wp.mesh_get_index(mesh_id, query.face * 3 + 1)
+    i2 = wp.mesh_get_index(mesh_id, query.face * 3 + 2)
+    wp.atomic_add(vertex_force_metric, i0, force)
+    wp.atomic_add(vertex_force_metric, i1, force)
+    wp.atomic_add(vertex_force_metric, i2, force)
 
 
 @wp.kernel
@@ -202,6 +343,74 @@ def accumulate_vessel_soft_contact_force_metric(
 
 
 @wp.kernel
+def accumulate_vessel_vertex_soft_contact_force_metric(
+    soft_contact_count: wp.array[wp.int32],
+    soft_contact_particle: wp.array[wp.int32],
+    soft_contact_shape: wp.array[wp.int32],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_body_vel: wp.array[wp.vec3],
+    soft_contact_normal: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    vessel_mesh_id: wp.uint64,
+    vessel_shape_idx: int,
+    query_radius: float,
+    ke: float,
+    kd: float,
+    mu: float,
+    force_metric: wp.array[float],
+):
+    tid = wp.tid()
+    if tid >= soft_contact_count[0] or query_radius <= 0.0:
+        return
+    if soft_contact_shape[tid] != vessel_shape_idx:
+        return
+
+    particle_idx = soft_contact_particle[tid]
+    if particle_idx < 0:
+        return
+
+    bx = soft_contact_body_pos[tid]
+    n = soft_contact_normal[tid]
+    px = particle_q[particle_idx]
+    radius = particle_radius[particle_idx]
+
+    penetration = -(wp.dot(n, px - bx) - radius)
+    if penetration <= 0.0:
+        return
+
+    rel_v = particle_qd[particle_idx] - soft_contact_body_vel[tid]
+    vn = wp.dot(rel_v, n)
+
+    fn_mag = ke * penetration
+    if vn < 0.0:
+        fn_mag = fn_mag - kd * vn
+    if fn_mag < 0.0:
+        fn_mag = 0.0
+
+    vt = rel_v - vn * n
+    f_tangent = -kd * vt
+    f_t_norm = wp.length(f_tangent)
+    f_t_max = mu * fn_mag
+    if f_t_norm > f_t_max and f_t_norm > 0.0:
+        f_tangent = f_tangent * (f_t_max / f_t_norm)
+
+    query = wp.mesh_query_point_no_sign(vessel_mesh_id, bx, query_radius)
+    if not query.result:
+        return
+
+    force = wp.length(fn_mag * n + f_tangent)
+    i0 = wp.mesh_get_index(vessel_mesh_id, query.face * 3 + 0)
+    i1 = wp.mesh_get_index(vessel_mesh_id, query.face * 3 + 1)
+    i2 = wp.mesh_get_index(vessel_mesh_id, query.face * 3 + 2)
+
+    wp.atomic_add(force_metric, i0, force)
+    wp.atomic_add(force_metric, i1, force)
+    wp.atomic_add(force_metric, i2, force)
+
+
+@wp.kernel
 def colorize_contact_force_metric(
     force_metric: wp.array[float],
     color_max: float,
@@ -224,6 +433,62 @@ def colorize_contact_force_metric(
         u = 2.0 * (t - 0.5)
         marker_colors[particle_idx] = wp.vec3(1.0, 1.0 - u, 0.0)
     marker_radii[particle_idx] = marker_radius
+
+
+@wp.kernel
+def colorize_vessel_contact_force_metric(
+    force_metric: wp.array[float],
+    color_max: float,
+    color_multiplier: float,
+    base_color: wp.vec4,
+    vertex_colors: wp.array[wp.vec4],
+):
+    vertex_idx = wp.tid()
+    force = force_metric[vertex_idx]
+    color = base_color
+
+    if force > 0.0 and color_max > 0.0 and color_multiplier > 0.0:
+        t = wp.min(force * color_multiplier / color_max, 1.0)
+        heat = wp.vec3(0.0, 0.0, 0.0)
+        if t < 0.5:
+            u = 2.0 * t
+            heat = wp.vec3(u, 0.25 + 0.75 * u, 1.0 - u)
+        else:
+            u = 2.0 * (t - 0.5)
+            heat = wp.vec3(1.0, 1.0 - u, 0.0)
+
+        color = wp.vec4(heat.x, heat.y, heat.z, base_color.w)
+
+    vertex_colors[vertex_idx] = color
+
+
+@wp.kernel
+def smooth_vertex_colors_laplacian(
+    source_colors: wp.array[wp.vec4],
+    neighbor_offsets: wp.array[wp.int32],
+    neighbor_indices: wp.array[wp.int32],
+    strength: float,
+    smoothed_colors: wp.array[wp.vec4],
+):
+    vertex_idx = wp.tid()
+    start = neighbor_offsets[vertex_idx]
+    end = neighbor_offsets[vertex_idx + 1]
+    neighbor_count = end - start
+    source = source_colors[vertex_idx]
+
+    if neighbor_count <= 0 or strength <= 0.0:
+        smoothed_colors[vertex_idx] = source
+        return
+
+    color_sum = wp.vec4(0.0, 0.0, 0.0, 0.0)
+    cursor = start
+    while cursor < end:
+        color_sum = color_sum + source_colors[neighbor_indices[cursor]]
+        cursor = cursor + 1
+
+    t = wp.min(wp.max(strength, 0.0), 1.0)
+    average = color_sum / float(neighbor_count)
+    smoothed_colors[vertex_idx] = (1.0 - t) * source + t * average
 
 
 @wp.kernel
@@ -318,9 +583,23 @@ class StaticTriMeshParticleProjector:
 
         self.points = wp.array(world_vertices, dtype=wp.vec3, device=device)
         self.indices = wp.array(mesh.indices, dtype=wp.int32, device=device)
+        if mesh.normals is not None and len(mesh.normals) == len(mesh.vertices):
+            normals = np.asarray(mesh.normals, dtype=np.float32)
+        else:
+            normals = compute_triangle_vertex_normals(world_vertices, mesh.indices)
+        self.normals = wp.array(normals, dtype=wp.vec3, device=device)
         self.mesh = wp.Mesh(points=self.points, indices=self.indices)
 
-    def project(self, model: newton.Model, state: newton.State, contact_radius: float, relaxation: float, dt: float):
+    def project(
+        self,
+        model: newton.Model,
+        state: newton.State,
+        contact_radius: float,
+        relaxation: float,
+        dt: float,
+        particle_force_metric: wp.array[float],
+        vertex_force_metric: wp.array[float],
+    ):
         wp.launch(
             kernel=project_particles_vs_static_tri_mesh,
             dim=model.particle_count,
@@ -334,6 +613,7 @@ class StaticTriMeshParticleProjector:
                 relaxation,
                 dt,
             ],
+            outputs=[particle_force_metric, vertex_force_metric],
             device=model.device,
         )
 
@@ -474,6 +754,30 @@ class Example:
             PLACEMENT_MAX_CLONE_FORCE_MAX,
         )
         self.show_placement_clone_targets = True
+        self.show_placement_driving_particles = True
+
+        self.minimou_controller: object | None = None
+        self.minimou_device_index = self._validate_minimou_device_index(args.minimou_device_index)
+        self.minimou_enabled = False
+        self.minimou_power_enabled = bool(args.minimou_power)
+        self.minimou_control_enabled = bool(args.minimou_control)
+        self.minimou_workspace_scale = self._clamp_minimou_workspace_scale(args.minimou_workspace_scale)
+        self.minimou_workspace_pos_offset = self._vec3_arg(
+            args.minimou_workspace_pos_offset,
+            "MiniMou workspace position offset",
+        )
+        self.minimou_workspace_rot_offset_deg = self._vec3_arg(
+            args.minimou_workspace_rot_offset,
+            "MiniMou workspace rotation offset",
+        )
+        self.minimou_last_sample: dict | None = None
+        self.minimou_status = "Disconnected"
+        self.minimou_error = ""
+        self.minimou_takeover_requested = True
+        self.minimou_anchor_device_transform: wp.transform | None = None
+        self.minimou_anchor_handle_transform: wp.transform | None = None
+        self.show_minimou_device_frame = True
+        self._minimou_enable_on_start = bool(args.minimou_enabled or args.minimou_power or args.minimou_control)
 
         self.fem_soft_vessel_contact_enabled = bool(args.fem_soft_vessel_contact)
         self.fem_soft_contact_stiffness_multiplier = min(
@@ -505,6 +809,26 @@ class Example:
             max(float(args.vessel_contact_force_color_max), VESSEL_CONTACT_FORCE_COLOR_MAX_MIN),
             VESSEL_CONTACT_FORCE_COLOR_MAX_MAX,
         )
+        self.vessel_contact_force_color_multiplier = min(
+            max(float(args.vessel_contact_force_color_multiplier), VESSEL_CONTACT_FORCE_COLOR_MULTIPLIER_MIN),
+            VESSEL_CONTACT_FORCE_COLOR_MULTIPLIER_MAX,
+        )
+        self.vessel_alpha = min(max(float(args.vessel_alpha), VESSEL_ALPHA_MIN), VESSEL_ALPHA_MAX)
+        self.vessel_transparent_surface = bool(args.vessel_transparent_surface)
+        self.vsd_contact_force_color_multiplier = min(
+            max(float(args.vsd_contact_force_color_multiplier), VSD_CONTACT_FORCE_COLOR_MULTIPLIER_MIN),
+            VSD_CONTACT_FORCE_COLOR_MULTIPLIER_MAX,
+        )
+        self.vsd_alpha = min(max(float(args.vsd_alpha), VSD_ALPHA_MIN), VSD_ALPHA_MAX)
+        self.vsd_transparent_surface = bool(args.vsd_transparent_surface)
+        self.contact_color_smoothing_passes = min(
+            max(int(args.contact_color_smoothing_passes), CONTACT_COLOR_SMOOTHING_PASSES_MIN),
+            CONTACT_COLOR_SMOOTHING_PASSES_MAX,
+        )
+        self.contact_color_smoothing_strength = min(
+            max(float(args.contact_color_smoothing_strength), CONTACT_COLOR_SMOOTHING_STRENGTH_MIN),
+            CONTACT_COLOR_SMOOTHING_STRENGTH_MAX,
+        )
         self._soft_contact_count_cached = 0
 
         self.iterations = 1
@@ -531,7 +855,7 @@ class Example:
         builder.add_ground_plane()
 
         tet_mesh = load_vtk_unstructured_tet_mesh(MESH_PATH)
-        vessel_mesh = load_vtk_unstructured_triangle_mesh(VESSEL_MESH_PATH)
+        vessel_mesh = load_vtk_triangle_mesh(VESSEL_MESH_PATH)
         self.mesh_scale = 0.05 * float(args.scale)
         self.anatomy_scale = 0.05 * float(args.anatomy_scale)
         ox, oy, oz = (float(v) for v in args.offset)
@@ -550,7 +874,7 @@ class Example:
                 kd=self.fem_soft_contact_kd,
                 mu=self.fem_soft_contact_mu,
             ),
-            color=(0.55, 0.18, 0.16),
+            color=VESSEL_BASE_COLOR,
             label="rvot_alterra_vessel",
         )
 
@@ -573,6 +897,8 @@ class Example:
         builder.color()
 
         self.model = builder.finalize()
+        self._simulation_particle_flags = self.model.particle_flags
+        self._set_vessel_model_shape_visible(False)
         if self.solver_type == "fem":
             self.model.soft_contact_ke = self._compute_fem_soft_contact_stiffness()
             self.model.soft_contact_kd = self.fem_soft_contact_kd
@@ -619,10 +945,35 @@ class Example:
         self.vessel_contact_force_metric = wp.zeros(self.model.particle_count, dtype=float, device=self.model.device)
         self.vessel_contact_marker_radii = wp.zeros(self.model.particle_count, dtype=float, device=self.model.device)
         self.vessel_contact_marker_colors = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.model.device)
+        self.vessel_vertex_force_metric = wp.zeros(
+            len(self.vessel_particle_projector.points), dtype=float, device=self.model.device
+        )
+        self.vessel_vertex_colors = wp.zeros(
+            len(self.vessel_particle_projector.points), dtype=wp.vec4, device=self.model.device
+        )
+        self.vessel_vertex_colors_scratch = wp.zeros(
+            len(self.vessel_particle_projector.points), dtype=wp.vec4, device=self.model.device
+        )
+        self.vessel_surface_indices_np = np.asarray(vessel_mesh.indices, dtype=np.int32)
+        self.vessel_color_neighbor_offsets: wp.array[wp.int32] | None = None
+        self.vessel_color_neighbor_indices: wp.array[wp.int32] | None = None
+        device_surface_indices = tet_mesh.surface_tri_indices.astype(np.int32) + self.device_particle_start
+        self.vsd_surface_indices_np = device_surface_indices
+        self.vsd_surface_indices = wp.array(device_surface_indices, dtype=wp.int32, device=self.model.device)
+        self.vsd_surface_vertex_colors = wp.zeros(
+            self.model.particle_count, dtype=wp.vec4, device=self.model.device
+        )
+        self.vsd_surface_vertex_colors_scratch = wp.zeros(
+            self.model.particle_count, dtype=wp.vec4, device=self.model.device
+        )
+        self.vsd_color_neighbor_offsets: wp.array[wp.int32] | None = None
+        self.vsd_color_neighbor_indices: wp.array[wp.int32] | None = None
+        self.placement_particle_indices_np = np.empty(0, dtype=np.int32)
         self.placement_particle_indices: wp.array[wp.int32] | None = None
         self.placement_rest_local_q: wp.array[wp.vec3] | None = None
         self.placement_target_q: wp.array[wp.vec3] | None = None
         self.placement_prev_target_q: wp.array[wp.vec3] | None = None
+        self.placement_render_particle_flags: wp.array[wp.int32] | None = None
         self.placement_clone_count = 0
         self.placement_control_transform = wp.array(
             [self.device_transform_gizmo.transform],
@@ -638,15 +989,27 @@ class Example:
         self._last_placement_control_scale = np.empty(0, dtype=np.float32)
         self._sync_placement_control_buffers(force=True)
         self._refresh_placement_clone_buffers()
+        self._create_world_origin_axes_buffers()
 
         self.viewer.set_model(self.model)
         self._connect_particle_drag_projection()
         self._register_contact_panel()
         self._register_placement_panel()
+        self._register_minimou_panel()
+        if self._minimou_enable_on_start:
+            self._set_minimou_enabled(True)
+        if self.minimou_control_enabled:
+            self._request_minimou_takeover()
         if hasattr(self.viewer, "set_camera"):
             self.viewer.set_camera(wp.vec3(1.8, -2.0, 1.1), -18.0, 132.0)
 
         self.capture()
+
+    def __del__(self):
+        try:
+            self._disconnect_minimou()
+        except Exception:
+            pass
 
     def _connect_particle_drag_projection(self):
         if self.solver_type != "fem" or not hasattr(self.solver, "set_particle_drag_constraint"):
@@ -671,6 +1034,48 @@ class Example:
         if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(lambda ui, ex=self: ex.placement_gui(ui), position="free")
 
+    def _register_minimou_panel(self):
+        if hasattr(self.viewer, "register_ui_callback"):
+            self.viewer.register_ui_callback(lambda ui, ex=self: ex.minimou_gui(ui), position="free")
+
+    def _create_world_origin_axes_buffers(self):
+        length = float(WORLD_ORIGIN_AXIS_LENGTH)
+        half_length = 0.5 * length
+        self.world_origin_axis_xforms = wp.array(
+            [
+                wp.transform(wp.vec3(half_length, 0.0, 0.0), wp.quat_identity()),
+                wp.transform(
+                    wp.vec3(0.0, half_length, 0.0),
+                    wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * math.pi),
+                ),
+                wp.transform(
+                    wp.vec3(0.0, 0.0, half_length),
+                    wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), -0.5 * math.pi),
+                ),
+            ],
+            dtype=wp.transform,
+            device=self.model.device,
+        )
+        self.world_origin_axis_colors = wp.array(
+            [
+                wp.vec3(1.0, 0.05, 0.05),
+                wp.vec3(0.05, 1.0, 0.05),
+                wp.vec3(0.05, 0.25, 1.0),
+            ],
+            dtype=wp.vec3,
+            device=self.model.device,
+        )
+        self.world_origin_cube_xform = wp.array(
+            [wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity())],
+            dtype=wp.transform,
+            device=self.model.device,
+        )
+        self.world_origin_cube_color = wp.array(
+            [wp.vec3(1.0, 1.0, 1.0)],
+            dtype=wp.vec3,
+            device=self.model.device,
+        )
+
     def _interactive_placement_available(self) -> bool:
         return self.solver_type == "fem"
 
@@ -681,9 +1086,216 @@ class Example:
         self.interactive_placement_enabled = bool(enabled) and self._interactive_placement_available()
         if self.interactive_placement_enabled and not self.viewer.is_paused():
             self.device_transform_gizmo.sync_to_particles(self.state_0)
+            if self.minimou_control_enabled:
+                self._request_minimou_takeover()
         self._reset_placement_clone_targets()
         self._sync_placement_control_buffers(force=True)
         self._mark_graph_recapture()
+
+    @staticmethod
+    def _validate_minimou_device_index(value) -> int:
+        if isinstance(value, bool):
+            raise ValueError("MiniMou device index must be a non-negative integer.")
+        result = int(value)
+        if result < 0:
+            raise ValueError("MiniMou device index must be a non-negative integer.")
+        return result
+
+    @staticmethod
+    def _clamp_minimou_workspace_scale(value) -> float:
+        return min(max(float(value), MINIMOU_WORKSPACE_SCALE_MIN), MINIMOU_WORKSPACE_SCALE_MAX)
+
+    @staticmethod
+    def _vec3_arg(values, name: str) -> np.ndarray:
+        result = np.asarray(values, dtype=np.float32)
+        if result.shape != (3,):
+            raise ValueError(f"{name} must contain exactly three values.")
+        return result
+
+    def _set_minimou_enabled(self, enabled: bool):
+        if not enabled:
+            self._disconnect_minimou()
+            self.minimou_enabled = False
+            self.minimou_control_enabled = False
+            self.minimou_status = "Disconnected"
+            return
+
+        if self.minimou_controller is not None:
+            self.minimou_enabled = True
+            return
+
+        try:
+            from newton.examples.slicer.follou import MiniMouController
+
+            self.minimou_controller = MiniMouController(
+                device_index=self.minimou_device_index,
+                scale=self.minimou_workspace_scale,
+            )
+            self.minimou_enabled = True
+            self.minimou_error = ""
+            self.minimou_status = "Connected"
+            if self.minimou_power_enabled:
+                self._set_minimou_power_enabled(True)
+            if self.minimou_control_enabled:
+                self._request_minimou_takeover()
+        except Exception as exc:
+            self.minimou_controller = None
+            self.minimou_enabled = False
+            self.minimou_error = str(exc)
+            self.minimou_status = "Connection failed"
+
+    def _disconnect_minimou(self):
+        controller, self.minimou_controller = self.minimou_controller, None
+        self.minimou_anchor_device_transform = None
+        self.minimou_anchor_handle_transform = None
+        self.minimou_last_sample = None
+        if controller is None:
+            return
+
+        close = getattr(controller, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                self.minimou_error = str(exc)
+
+    def _set_minimou_power_enabled(self, enabled: bool):
+        self.minimou_power_enabled = bool(enabled)
+        if self.minimou_power_enabled and self.minimou_controller is None:
+            self._set_minimou_enabled(True)
+
+        if self.minimou_controller is None:
+            return
+
+        try:
+            self.minimou_controller.set_power(self.minimou_power_enabled)
+            self.minimou_error = ""
+        except Exception as exc:
+            self.minimou_error = str(exc)
+            self.minimou_status = "Power command failed"
+
+    def _set_minimou_control_enabled(self, enabled: bool):
+        self.minimou_control_enabled = bool(enabled)
+        if not self.minimou_control_enabled:
+            self.minimou_anchor_device_transform = None
+            self.minimou_anchor_handle_transform = None
+            return
+
+        if not self.minimou_enabled:
+            self._set_minimou_enabled(True)
+        if not self.minimou_enabled:
+            self.minimou_control_enabled = False
+            return
+
+        self._request_minimou_takeover()
+
+    def _request_minimou_takeover(self):
+        self.minimou_takeover_requested = True
+        self.minimou_anchor_device_transform = None
+        self.minimou_anchor_handle_transform = None
+        if self.minimou_control_enabled:
+            self.minimou_status = "Takeover pending"
+
+    def _minimou_control_active(self) -> bool:
+        return self.minimou_enabled and self.minimou_control_enabled and self.minimou_controller is not None
+
+    def _poll_minimou(self) -> dict | None:
+        if self.minimou_controller is None:
+            return None
+
+        try:
+            if hasattr(self.minimou_controller, "scale"):
+                self.minimou_controller.scale = self.minimou_workspace_scale
+            sample = self.minimou_controller.poll()
+        except Exception as exc:
+            self.minimou_error = str(exc)
+            self.minimou_status = "Poll failed"
+            return None
+
+        if not sample.get("valid", False):
+            self.minimou_status = "Invalid sample"
+            return None
+
+        self.minimou_last_sample = sample
+        if self.minimou_takeover_requested:
+            self.minimou_status = "Takeover pending"
+        else:
+            self.minimou_status = "Tracking" if self.minimou_control_enabled else "Connected"
+        return sample
+
+    def _minimou_workspace_transform(self) -> wp.transform:
+        roll, pitch, yaw = (math.radians(float(value)) for value in self.minimou_workspace_rot_offset_deg)
+        return wp.transform(
+            wp.vec3(
+                float(self.minimou_workspace_pos_offset[0]),
+                float(self.minimou_workspace_pos_offset[1]),
+                float(self.minimou_workspace_pos_offset[2]),
+            ),
+            wp.quat_rpy(roll, pitch, yaw),
+        )
+
+    def _minimou_sample_transform(self, sample: dict) -> wp.transform:
+        position = np.asarray(sample["position"], dtype=np.float32)
+        rotation = np.asarray(sample["rotation"], dtype=np.float32)
+        device_transform = wp.transform(
+            wp.vec3(float(position[0]), float(position[1]), float(position[2])),
+            wp.quat(float(rotation[0]), float(rotation[1]), float(rotation[2]), float(rotation[3])),
+        )
+        return wp.transform_multiply(self._minimou_workspace_transform(), device_transform)
+
+    @staticmethod
+    def _transform_components(transform: wp.transform) -> tuple[np.ndarray, np.ndarray]:
+        values = np.asarray(transform, dtype=np.float32)
+        return values[:3], normalize_quat_xyzw(values[3:])
+
+    def _capture_minimou_takeover(self, device_transform: wp.transform):
+        self.minimou_anchor_device_transform = wp.transform(*device_transform)
+        self.minimou_anchor_handle_transform = wp.transform(*self.device_transform_gizmo.transform)
+        self.minimou_takeover_requested = False
+        self.minimou_status = "Tracking"
+
+    def _reset_minimou_handle_offset(self):
+        if not self._minimou_control_active():
+            return
+
+        sample = self._poll_minimou()
+        if sample is None:
+            return
+
+        device_transform = self._minimou_sample_transform(sample)
+        self.device_transform_gizmo.transform[:] = device_transform
+        self.minimou_anchor_device_transform = wp.transform(*device_transform)
+        self.minimou_anchor_handle_transform = wp.transform(*device_transform)
+        self.minimou_takeover_requested = False
+        self.minimou_status = "Offset reset"
+
+    def _update_minimou_controlled_gizmo(self):
+        if not self._minimou_control_active():
+            return
+
+        sample = self._poll_minimou()
+        if sample is None:
+            return
+
+        device_transform = self._minimou_sample_transform(sample)
+        if (
+            self.minimou_takeover_requested
+            or self.minimou_anchor_device_transform is None
+            or self.minimou_anchor_handle_transform is None
+        ):
+            self._capture_minimou_takeover(device_transform)
+            return
+
+        device_pos, device_rot = self._transform_components(device_transform)
+        anchor_device_pos, anchor_device_rot = self._transform_components(self.minimou_anchor_device_transform)
+        anchor_handle_pos, anchor_handle_rot = self._transform_components(self.minimou_anchor_handle_transform)
+
+        target_pos = anchor_handle_pos + (device_pos - anchor_device_pos)
+        target_rot = quat_mul_xyzw(quat_mul_xyzw(device_rot, quat_inverse_xyzw(anchor_device_rot)), anchor_handle_rot)
+        self.device_transform_gizmo.transform[:] = wp.transform(
+            wp.vec3(float(target_pos[0]), float(target_pos[1]), float(target_pos[2])),
+            wp.quat(float(target_rot[0]), float(target_rot[1]), float(target_rot[2]), float(target_rot[3])),
+        )
 
     def _refresh_placement_clone_buffers(self):
         enabled_axes = tuple(axis for axis, enabled in enumerate(self.placement_drive_axes) if enabled)
@@ -703,12 +1315,23 @@ class Example:
         rest_local_q = local_q[local_indices].astype(np.float32, copy=False)
 
         self.placement_clone_count = int(local_indices.shape[0])
+        self.placement_particle_indices_np = particle_indices
         self.placement_particle_indices = wp.array(particle_indices, dtype=wp.int32, device=self.model.device)
         self.placement_rest_local_q = wp.array(rest_local_q, dtype=wp.vec3, device=self.model.device)
         self.placement_target_q = wp.zeros(self.placement_clone_count, dtype=wp.vec3, device=self.model.device)
         self.placement_prev_target_q = wp.zeros(self.placement_clone_count, dtype=wp.vec3, device=self.model.device)
+        self._refresh_placement_render_particle_flags()
         self._reset_placement_clone_targets()
         self._mark_graph_recapture()
+
+    def _refresh_placement_render_particle_flags(self):
+        self.placement_render_particle_flags = None
+        if self._simulation_particle_flags is None or self.placement_clone_count == 0:
+            return
+
+        flags = self._simulation_particle_flags.numpy().copy()
+        flags[self.placement_particle_indices_np] &= ~int(newton.ParticleFlags.ACTIVE)
+        self.placement_render_particle_flags = wp.array(flags, dtype=wp.int32, device=self.model.device)
 
     def _device_compression_vec3(self) -> wp.vec3:
         return wp.vec3(
@@ -806,6 +1429,15 @@ class Example:
             flags[self.vessel_shape_idx] |= particle_collision
         else:
             flags[self.vessel_shape_idx] &= ~particle_collision
+        self.model.shape_flags.assign(flags)
+
+    def _set_vessel_model_shape_visible(self, visible: bool):
+        flags = self.model.shape_flags.numpy()
+        visible_flag = int(newton.ShapeFlags.VISIBLE)
+        if visible:
+            flags[self.vessel_shape_idx] |= visible_flag
+        else:
+            flags[self.vessel_shape_idx] &= ~visible_flag
         self.model.shape_flags.assign(flags)
 
     def _set_fem_soft_vessel_contact_enabled(self, enabled: bool):
@@ -930,6 +1562,8 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def _project_vessel_particle_contacts(self, state: newton.State):
+        self.vessel_contact_force_metric.zero_()
+        self.vessel_vertex_force_metric.zero_()
         for _ in range(self.vessel_contact_iterations):
             self.vessel_particle_projector.project(
                 self.model,
@@ -937,9 +1571,12 @@ class Example:
                 self.vessel_contact_radius,
                 self.vessel_contact_relaxation,
                 self.sim_dt,
+                self.vessel_contact_force_metric,
+                self.vessel_vertex_force_metric,
             )
 
     def step(self):
+        self._update_minimou_controlled_gizmo()
         if self._interactive_placement_available():
             self._sync_placement_control_buffers()
 
@@ -974,24 +1611,54 @@ class Example:
                 self.device_transform_gizmo.transform,
                 space=self.device_gizmo_space,
             )
-        self.viewer.log_state(self.state_0)
+        self._render_world_origin_axes()
+        self._render_minimou_device_frame()
+        self._update_vessel_contact_force_metrics()
+        show_triangles = self.viewer.show_triangles
+        self.viewer.show_triangles = False
+        try:
+            self._log_state_with_particle_visibility()
+        finally:
+            self.viewer.show_triangles = show_triangles
         self.viewer.log_contacts(self.contacts, self.state_0)
+        self._render_vessel_contact_mesh()
+        self._render_vsd_contact_mesh()
         self._render_vessel_contact_markers()
         self._render_placement_clone_targets()
         self.viewer.end_frame()
 
-    def _render_vessel_contact_markers(self):
-        marker_name = "/vsd/vessel_contact_markers"
-        if (
-            not self.show_vessel_contact_markers
-            or not self._use_fem_soft_vessel_contact()
-            or self.contacts is None
-            or self.contacts.soft_contact_max <= 0
-        ):
-            self.viewer.log_points(marker_name, points=None, hidden=True)
+    def _log_state_with_particle_visibility(self):
+        if not self._should_hide_placement_driving_particles():
+            self.viewer.log_state(self.state_0)
+            return
+
+        particle_flags = self.model.particle_flags
+        self.model.particle_flags = self.placement_render_particle_flags
+        try:
+            self.viewer.log_state(self.state_0)
+        finally:
+            self.model.particle_flags = particle_flags
+
+    def _should_hide_placement_driving_particles(self) -> bool:
+        return (
+            not self.show_placement_driving_particles
+            and self._use_interactive_placement()
+            and self.placement_clone_count > 0
+            and self.placement_render_particle_flags is not None
+        )
+
+    def _update_vessel_contact_force_metrics(self):
+        if not self._use_fem_soft_vessel_contact():
+            if not self._use_vessel_particle_projection():
+                self.vessel_contact_force_metric.zero_()
+                self.vessel_vertex_force_metric.zero_()
             return
 
         self.vessel_contact_force_metric.zero_()
+        self.vessel_vertex_force_metric.zero_()
+        if self.contacts is None or self.contacts.soft_contact_max <= 0:
+            return
+
         wp.launch(
             kernel=accumulate_vessel_soft_contact_force_metric,
             dim=self.contacts.soft_contact_max,
@@ -1013,6 +1680,191 @@ class Example:
             outputs=[self.vessel_contact_force_metric],
             device=self.model.device,
         )
+        wp.launch(
+            kernel=accumulate_vessel_vertex_soft_contact_force_metric,
+            dim=self.contacts.soft_contact_max,
+            inputs=[
+                self.contacts.soft_contact_count,
+                self.contacts.soft_contact_particle,
+                self.contacts.soft_contact_shape,
+                self.contacts.soft_contact_body_pos,
+                self.contacts.soft_contact_body_vel,
+                self.contacts.soft_contact_normal,
+                self.state_0.particle_q,
+                self.state_0.particle_qd,
+                self.model.particle_radius,
+                self.vessel_particle_projector.mesh.id,
+                self.vessel_shape_idx,
+                self._vessel_contact_color_query_radius(),
+                self._compute_fem_soft_contact_stiffness(),
+                self.fem_soft_contact_kd,
+                self.fem_soft_contact_mu,
+            ],
+            outputs=[self.vessel_vertex_force_metric],
+            device=self.model.device,
+        )
+
+    def _vessel_base_color(self) -> wp.vec4:
+        return wp.vec4(
+            float(VESSEL_BASE_COLOR[0]),
+            float(VESSEL_BASE_COLOR[1]),
+            float(VESSEL_BASE_COLOR[2]),
+            self._vessel_surface_alpha(),
+        )
+
+    def _vsd_base_color(self) -> wp.vec4:
+        return wp.vec4(
+            float(VSD_BASE_COLOR[0]),
+            float(VSD_BASE_COLOR[1]),
+            float(VSD_BASE_COLOR[2]),
+            self._vsd_surface_alpha(),
+        )
+
+    def _vessel_surface_alpha(self) -> float:
+        return self.vessel_alpha if self.vessel_transparent_surface else 1.0
+
+    def _vsd_surface_alpha(self) -> float:
+        return self.vsd_alpha if self.vsd_transparent_surface else 1.0
+
+    def _smooth_surface_vertex_colors(
+        self,
+        vertex_colors: wp.array[wp.vec4],
+        scratch_colors: wp.array[wp.vec4],
+        surface_indices: np.ndarray,
+        vertex_count: int,
+        neighbor_offsets_attr: str,
+        neighbor_indices_attr: str,
+    ) -> wp.array[wp.vec4]:
+        passes = self.contact_color_smoothing_passes
+        strength = self.contact_color_smoothing_strength
+        if passes <= 0 or strength <= 0.0:
+            return vertex_colors
+
+        neighbor_offsets, neighbor_indices = self._get_surface_color_adjacency(
+            surface_indices,
+            vertex_count,
+            neighbor_offsets_attr,
+            neighbor_indices_attr,
+        )
+        source = vertex_colors
+        destination = scratch_colors
+        for _ in range(passes):
+            wp.launch(
+                kernel=smooth_vertex_colors_laplacian,
+                dim=len(vertex_colors),
+                inputs=[source, neighbor_offsets, neighbor_indices, strength],
+                outputs=[destination],
+                device=self.model.device,
+            )
+            source, destination = destination, source
+
+        return source
+
+    def _get_surface_color_adjacency(
+        self,
+        surface_indices: np.ndarray,
+        vertex_count: int,
+        neighbor_offsets_attr: str,
+        neighbor_indices_attr: str,
+    ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+        neighbor_offsets = getattr(self, neighbor_offsets_attr)
+        neighbor_indices = getattr(self, neighbor_indices_attr)
+        if neighbor_offsets is None or neighbor_indices is None:
+            offsets_np, indices_np = build_triangle_vertex_adjacency(surface_indices, vertex_count)
+            neighbor_offsets = wp.array(offsets_np, dtype=wp.int32, device=self.model.device)
+            neighbor_indices = wp.array(indices_np, dtype=wp.int32, device=self.model.device)
+            setattr(self, neighbor_offsets_attr, neighbor_offsets)
+            setattr(self, neighbor_indices_attr, neighbor_indices)
+
+        return neighbor_offsets, neighbor_indices
+
+    def _vessel_contact_color_query_radius(self) -> float:
+        return max(self.fem_soft_contact_margin, self.device_particle_radius, 1.0e-4)
+
+    def _render_vsd_contact_mesh(self):
+        mesh_name = "/vsd/device_contact_mesh"
+
+        wp.launch(
+            kernel=colorize_vessel_contact_force_metric,
+            dim=self.model.particle_count,
+            inputs=[
+                self.vessel_contact_force_metric,
+                self.vessel_contact_force_color_max,
+                self.vsd_contact_force_color_multiplier,
+                self._vsd_base_color(),
+            ],
+            outputs=[self.vsd_surface_vertex_colors],
+            device=self.model.device,
+        )
+        vertex_colors = self._smooth_surface_vertex_colors(
+            self.vsd_surface_vertex_colors,
+            self.vsd_surface_vertex_colors_scratch,
+            self.vsd_surface_indices_np,
+            self.model.particle_count,
+            "vsd_color_neighbor_offsets",
+            "vsd_color_neighbor_indices",
+        )
+
+        self.viewer.log_mesh(
+            mesh_name,
+            self.state_0.particle_q,
+            self.vsd_surface_indices,
+            hidden=False,
+            backface_culling=True,
+            color=(1.0, 1.0, 1.0, 1.0),
+            roughness=0.7,
+            vertex_colors=vertex_colors,
+            transparent=self.vsd_transparent_surface and self.vsd_alpha < 0.999,
+        )
+
+    def _render_vessel_contact_mesh(self):
+        mesh_name = "/vsd/vessel_contact_mesh"
+
+        wp.launch(
+            kernel=colorize_vessel_contact_force_metric,
+            dim=len(self.vessel_vertex_colors),
+            inputs=[
+                self.vessel_vertex_force_metric,
+                self.vessel_contact_force_color_max,
+                self.vessel_contact_force_color_multiplier,
+                self._vessel_base_color(),
+            ],
+            outputs=[self.vessel_vertex_colors],
+            device=self.model.device,
+        )
+        vertex_colors = self._smooth_surface_vertex_colors(
+            self.vessel_vertex_colors,
+            self.vessel_vertex_colors_scratch,
+            self.vessel_surface_indices_np,
+            len(self.vessel_particle_projector.points),
+            "vessel_color_neighbor_offsets",
+            "vessel_color_neighbor_indices",
+        )
+
+        self.viewer.log_mesh(
+            mesh_name,
+            self.vessel_particle_projector.points,
+            self.vessel_particle_projector.indices,
+            normals=self.vessel_particle_projector.normals,
+            hidden=False,
+            backface_culling=True,
+            color=(1.0, 1.0, 1.0, 1.0),
+            roughness=0.8,
+            vertex_colors=vertex_colors,
+            transparent=self.vessel_transparent_surface and self.vessel_alpha < 0.999,
+        )
+
+    def _render_vessel_contact_markers(self):
+        marker_name = "/vsd/vessel_contact_markers"
+        if not self.show_vessel_contact_markers or not (
+            self._use_fem_soft_vessel_contact() or self._use_vessel_particle_projection()
+        ):
+            self.viewer.log_points(marker_name, points=None, hidden=True)
+            return
+        if self._use_fem_soft_vessel_contact() and (self.contacts is None or self.contacts.soft_contact_max <= 0):
+            self.viewer.log_points(marker_name, points=None, hidden=True)
+            return
+
         wp.launch(
             kernel=colorize_contact_force_metric,
             dim=self.model.particle_count,
@@ -1051,6 +1903,71 @@ class Example:
             hidden=False,
         )
 
+    def _render_world_origin_axes(self):
+        if not hasattr(self.viewer, "log_shapes"):
+            return
+
+        self.viewer.log_shapes(
+            "/vsd/world_origin_axes",
+            newton.GeoType.BOX,
+            (
+                0.5 * WORLD_ORIGIN_AXIS_LENGTH,
+                WORLD_ORIGIN_AXIS_THICKNESS,
+                WORLD_ORIGIN_AXIS_THICKNESS,
+            ),
+            self.world_origin_axis_xforms,
+            self.world_origin_axis_colors,
+        )
+        self.viewer.log_shapes(
+            "/vsd/world_origin_cube",
+            newton.GeoType.BOX,
+            WORLD_ORIGIN_CUBE_HALF_EXTENT,
+            self.world_origin_cube_xform,
+            self.world_origin_cube_color,
+        )
+
+    def _render_minimou_device_frame(self):
+        frame_name = "/vsd/minimou_device_frame"
+        if not hasattr(self.viewer, "log_arrows"):
+            return
+
+        if not self.show_minimou_device_frame or not self.minimou_enabled or self.minimou_controller is None:
+            self.viewer.log_arrows(frame_name, None, None, None)
+            return
+
+        if not self._minimou_control_active():
+            self._poll_minimou()
+
+        if self.minimou_last_sample is None:
+            self.viewer.log_arrows(frame_name, None, None, None)
+            return
+
+        device_transform = self._minimou_sample_transform(self.minimou_last_sample)
+        position, rotation = self._transform_components(device_transform)
+        axis_length = float(MINIMOU_DEVICE_FRAME_AXIS_LENGTH)
+        axes = np.asarray(
+            (
+                (axis_length, 0.0, 0.0),
+                (0.0, axis_length, 0.0),
+                (0.0, 0.0, axis_length),
+            ),
+            dtype=np.float32,
+        )
+        starts_np = np.repeat(position[None, :], 3, axis=0)
+        ends_np = starts_np + np.asarray([quat_rotate_xyzw(rotation, axis) for axis in axes], dtype=np.float32)
+        colors_np = np.asarray(
+            (
+                (1.0, 0.1, 0.1),
+                (0.1, 1.0, 0.1),
+                (0.1, 0.35, 1.0),
+            ),
+            dtype=np.float32,
+        )
+        starts = wp.array(starts_np, dtype=wp.vec3, device=self.model.device)
+        ends = wp.array(ends_np, dtype=wp.vec3, device=self.model.device)
+        colors = wp.array(colors_np, dtype=wp.vec3, device=self.model.device)
+        self.viewer.log_arrows(frame_name, starts, ends, colors)
+
     def _handle_global_keys(self):
         gravity_down = bool(self.viewer.is_key_down("g"))
         if gravity_down and not self._gravity_key_was_down:
@@ -1083,7 +2000,10 @@ class Example:
 
         if not self.device_transform_gizmo._was_paused:
             self.device_transform_gizmo.sync_to_particles(self.state_0)
+            if self.minimou_control_enabled:
+                self._request_minimou_takeover()
 
+        self._update_minimou_controlled_gizmo()
         self.device_transform_gizmo.apply_delta_if_changed(self.model, (self.state_0, self.state_1))
         self._handle_pause_device_keys()
         if self._use_interactive_placement():
@@ -1178,6 +2098,8 @@ class Example:
             (self.state_0, self.state_1),
             self.device_compression,
         )
+        if self.minimou_control_enabled:
+            self._request_minimou_takeover()
         print(f"Loaded VSD device pose slot {slot}.")
 
     def _load_device_pose_slots_from_file(self):
@@ -1252,6 +2174,108 @@ class Example:
         changed, local_space = ui.checkbox("Local Gizmo Space", self.device_gizmo_space == "local")
         if changed:
             self.device_gizmo_space = "local" if local_space else "world"
+
+    def minimou_gui(self, ui):
+        if not hasattr(ui, "begin"):
+            return
+
+        ui.set_next_window_pos(ui.ImVec2(1060.0, 20.0), ui.Cond_.appearing)
+        ui.set_next_window_size(ui.ImVec2(360.0, 340.0), ui.Cond_.appearing)
+        if not ui.begin("MiniMou Input"):
+            ui.end()
+            return
+
+        if hasattr(ui, "input_int"):
+            index_disabled = self.minimou_enabled and hasattr(ui, "begin_disabled")
+            if index_disabled:
+                ui.begin_disabled()
+            changed, value = ui.input_int("Device Index", self.minimou_device_index, 1, 1)
+            if changed:
+                self.minimou_device_index = self._validate_minimou_device_index(value)
+            if index_disabled:
+                ui.end_disabled()
+
+        changed, enabled = ui.checkbox("Enable MiniMou", self.minimou_enabled)
+        if changed:
+            self._set_minimou_enabled(bool(enabled))
+
+        changed, power = ui.checkbox("Power Device", self.minimou_power_enabled)
+        if changed:
+            self._set_minimou_power_enabled(bool(power))
+
+        changed, control = ui.checkbox("Control Handle", self.minimou_control_enabled)
+        if changed:
+            self._set_minimou_control_enabled(bool(control))
+
+        if self.minimou_control_enabled and ui.button("Reset Offset"):
+            self._reset_minimou_handle_offset()
+
+        changed, show_frame = ui.checkbox("Device XYZ Frame", self.show_minimou_device_frame)
+        if changed:
+            self.show_minimou_device_frame = bool(show_frame)
+
+        if ui.button("Takeover Current Handle"):
+            self._request_minimou_takeover()
+
+        ui.separator()
+        changed, value = ui.slider_float(
+            "Workspace Scale",
+            self.minimou_workspace_scale,
+            MINIMOU_WORKSPACE_SCALE_MIN,
+            MINIMOU_WORKSPACE_SCALE_MAX,
+            "%.3f",
+        )
+        if changed:
+            self.minimou_workspace_scale = self._clamp_minimou_workspace_scale(value)
+            if self.minimou_control_enabled:
+                self._request_minimou_takeover()
+
+        changed, value = ui.drag_float3(
+            "Pos Offset",
+            self.minimou_workspace_pos_offset.tolist(),
+            MINIMOU_POSITION_OFFSET_SPEED,
+            -10.0,
+            10.0,
+            "%.3f",
+        )
+        if changed:
+            self.minimou_workspace_pos_offset = self._vec3_arg(value, "MiniMou workspace position offset")
+            if self.minimou_control_enabled:
+                self._request_minimou_takeover()
+
+        changed, value = ui.drag_float3(
+            "Rot Offset XYZ Deg",
+            self.minimou_workspace_rot_offset_deg.tolist(),
+            MINIMOU_ROTATION_OFFSET_SPEED_DEG,
+            -180.0,
+            180.0,
+            "%.1f",
+        )
+        if changed:
+            self.minimou_workspace_rot_offset_deg = self._vec3_arg(value, "MiniMou workspace rotation offset")
+            if self.minimou_control_enabled:
+                self._request_minimou_takeover()
+
+        ui.separator()
+        ui.text(f"Status: {self.minimou_status}")
+        if self.minimou_error:
+            ui.text(f"Error: {self.minimou_error}")
+        if self.minimou_last_sample is not None:
+            grip = float(self.minimou_last_sample.get("grip", 0.0))
+            button = bool(self.minimou_last_sample.get("button", False))
+            raw_pos = np.asarray(self.minimou_last_sample.get("raw_position", (0.0, 0.0, 0.0)), dtype=np.float32)
+            pos = np.asarray(self.minimou_last_sample.get("position", (0.0, 0.0, 0.0)), dtype=np.float32)
+            raw_rot = np.asarray(self.minimou_last_sample.get("raw_rotation", (0.0, 0.0, 0.0, 1.0)), dtype=np.float32)
+            rot = np.asarray(self.minimou_last_sample.get("rotation", (0.0, 0.0, 0.0, 1.0)), dtype=np.float32)
+            ui.text(f"Raw Pos: {raw_pos[0]:.3f}, {raw_pos[1]:.3f}, {raw_pos[2]:.3f}")
+            ui.text(f"Mapped Pos: {pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}")
+            ui.text(f"Raw Quat: {raw_rot[0]:.3f}, {raw_rot[1]:.3f}, {raw_rot[2]:.3f}, {raw_rot[3]:.3f}")
+            ui.text(f"Mapped Quat: {rot[0]:.3f}, {rot[1]:.3f}, {rot[2]:.3f}, {rot[3]:.3f}")
+            ui.text(f"Grip: {grip:.2f}  Button: {button}")
+        if self.minimou_control_enabled and not self.viewer.is_paused() and not self._use_interactive_placement():
+            ui.text("Running control requires Interactive Placement.")
+
+        ui.end()
 
     def placement_gui(self, ui):
         if not hasattr(ui, "begin"):
@@ -1346,6 +2370,10 @@ class Example:
         if changed:
             self.show_placement_clone_targets = bool(show_targets)
 
+        changed, show_particles = ui.checkbox("Driving Particles", self.show_placement_driving_particles)
+        if changed:
+            self.show_placement_driving_particles = bool(show_particles)
+
         ui.text(f"Selected Particles: {self.placement_clone_count}")
 
         if placement_disabled and hasattr(ui, "end_disabled"):
@@ -1426,7 +2454,7 @@ class Example:
             return
 
         ui.set_next_window_pos(ui.ImVec2(325.0, 20.0), ui.Cond_.appearing)
-        ui.set_next_window_size(ui.ImVec2(360.0, 390.0), ui.Cond_.appearing)
+        ui.set_next_window_size(ui.ImVec2(360.0, 540.0), ui.Cond_.appearing)
         if not ui.begin("VSD Vessel Contact"):
             ui.end()
             return
@@ -1545,6 +2573,86 @@ class Example:
             self.vessel_contact_force_color_max = min(
                 max(float(value), VESSEL_CONTACT_FORCE_COLOR_MAX_MIN),
                 VESSEL_CONTACT_FORCE_COLOR_MAX_MAX,
+            )
+
+        changed, value = ui.slider_float(
+            "Vessel Color Mult",
+            self.vessel_contact_force_color_multiplier,
+            VESSEL_CONTACT_FORCE_COLOR_MULTIPLIER_MIN,
+            VESSEL_CONTACT_FORCE_COLOR_MULTIPLIER_MAX,
+            "%.1f",
+        )
+        if changed:
+            self.vessel_contact_force_color_multiplier = min(
+                max(float(value), VESSEL_CONTACT_FORCE_COLOR_MULTIPLIER_MIN),
+                VESSEL_CONTACT_FORCE_COLOR_MULTIPLIER_MAX,
+            )
+
+        changed, value = ui.slider_float(
+            "Vessel Alpha",
+            self.vessel_alpha,
+            VESSEL_ALPHA_MIN,
+            VESSEL_ALPHA_MAX,
+            "%.2f",
+        )
+        if changed:
+            self.vessel_alpha = min(max(float(value), VESSEL_ALPHA_MIN), VESSEL_ALPHA_MAX)
+
+        changed, transparent = ui.checkbox("Vessel Transparent", self.vessel_transparent_surface)
+        if changed:
+            self.vessel_transparent_surface = bool(transparent)
+
+        changed, value = ui.slider_float(
+            "VSD Color Mult",
+            self.vsd_contact_force_color_multiplier,
+            VSD_CONTACT_FORCE_COLOR_MULTIPLIER_MIN,
+            VSD_CONTACT_FORCE_COLOR_MULTIPLIER_MAX,
+            "%.1f",
+        )
+        if changed:
+            self.vsd_contact_force_color_multiplier = min(
+                max(float(value), VSD_CONTACT_FORCE_COLOR_MULTIPLIER_MIN),
+                VSD_CONTACT_FORCE_COLOR_MULTIPLIER_MAX,
+            )
+
+        changed, value = ui.slider_float(
+            "VSD Alpha",
+            self.vsd_alpha,
+            VSD_ALPHA_MIN,
+            VSD_ALPHA_MAX,
+            "%.2f",
+        )
+        if changed:
+            self.vsd_alpha = min(max(float(value), VSD_ALPHA_MIN), VSD_ALPHA_MAX)
+
+        changed, transparent = ui.checkbox("VSD Transparent", self.vsd_transparent_surface)
+        if changed:
+            self.vsd_transparent_surface = bool(transparent)
+
+        changed, value = ui.slider_int(
+            "Color Smooth Passes",
+            self.contact_color_smoothing_passes,
+            CONTACT_COLOR_SMOOTHING_PASSES_MIN,
+            CONTACT_COLOR_SMOOTHING_PASSES_MAX,
+            "%d",
+        )
+        if changed:
+            self.contact_color_smoothing_passes = min(
+                max(int(value), CONTACT_COLOR_SMOOTHING_PASSES_MIN),
+                CONTACT_COLOR_SMOOTHING_PASSES_MAX,
+            )
+
+        changed, value = ui.slider_float(
+            "Color Smooth Strength",
+            self.contact_color_smoothing_strength,
+            CONTACT_COLOR_SMOOTHING_STRENGTH_MIN,
+            CONTACT_COLOR_SMOOTHING_STRENGTH_MAX,
+            "%.2f",
+        )
+        if changed:
+            self.contact_color_smoothing_strength = min(
+                max(float(value), CONTACT_COLOR_SMOOTHING_STRENGTH_MIN),
+                CONTACT_COLOR_SMOOTHING_STRENGTH_MAX,
             )
 
         ui.separator()
@@ -1712,13 +2820,61 @@ class Example:
             "--show-vessel-contact-markers",
             help="Show per-particle vessel contact force markers.",
             action=argparse.BooleanOptionalAction,
-            default=True,
+            default=False,
         )
         parser.add_argument(
             "--vessel-contact-force-color-max",
-            help="Force magnitude [N] mapped to the hottest vessel contact marker color.",
+            help="Force magnitude [N] mapped to the hottest vessel contact color.",
             type=float,
             default=1000.0,
+        )
+        parser.add_argument(
+            "--vessel-contact-force-color-multiplier",
+            help="Multiplier applied before mapping vessel contact force to vertex color.",
+            type=float,
+            default=10.0,
+        )
+        parser.add_argument(
+            "--vessel-alpha",
+            help="Vessel mesh opacity alpha in [0, 1].",
+            type=float,
+            default=0.45,
+        )
+        parser.add_argument(
+            "--vessel-transparent-surface",
+            help="Render the vessel surface through the transparent mesh path.",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        parser.add_argument(
+            "--vsd-contact-force-color-multiplier",
+            help="Multiplier applied before mapping VSD contact force to surface color.",
+            type=float,
+            default=10.0,
+        )
+        parser.add_argument(
+            "--vsd-alpha",
+            help="VSD device surface opacity alpha in [0, 1].",
+            type=float,
+            default=1.0,
+        )
+        parser.add_argument(
+            "--vsd-transparent-surface",
+            help="Render the VSD surface through the transparent mesh path.",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        parser.add_argument(
+            "--contact-color-smoothing-passes",
+            help="Laplacian smoothing passes applied to vessel and VSD vertex colors.",
+            type=int,
+            default=0,
+        )
+        parser.add_argument(
+            "--contact-color-smoothing-strength",
+            help="Per-pass Laplacian smoothing strength for vessel and VSD vertex colors.",
+            type=float,
+            default=0.5,
         )
         parser.add_argument(
             "--device-gizmo-space",
@@ -1778,6 +2934,52 @@ class Example:
             help="JSON file used to persist pause-mode VSD device pose slots.",
             type=str,
             default=str(DEFAULT_DEVICE_POSE_SLOTS_PATH),
+        )
+        parser.add_argument(
+            "--minimou-enabled",
+            help="Connect to a MiniMou device when the example starts.",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
+        parser.add_argument(
+            "--minimou-power",
+            help="Send the MiniMou power-on command when the device is connected.",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
+        parser.add_argument(
+            "--minimou-control",
+            help="Drive the VSD handle gizmo from the MiniMou device.",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
+        parser.add_argument(
+            "--minimou-device-index",
+            help="Zero-based MiniMou device index from the Follou device scan.",
+            type=int,
+            default=0,
+        )
+        parser.add_argument(
+            "--minimou-workspace-scale",
+            help="Scale applied to MiniMou workspace position deltas.",
+            type=float,
+            default=0.001,
+        )
+        parser.add_argument(
+            "--minimou-workspace-pos-offset",
+            help="MiniMou workspace position offset [m].",
+            type=float,
+            nargs=3,
+            metavar=("X", "Y", "Z"),
+            default=[0.0, 0.0, 0.0],
+        )
+        parser.add_argument(
+            "--minimou-workspace-rot-offset",
+            help="MiniMou workspace rotation offset as XYZ Euler angles [deg].",
+            type=float,
+            nargs=3,
+            metavar=("X", "Y", "Z"),
+            default=[0.0, 0.0, 0.0],
         )
         return parser
 

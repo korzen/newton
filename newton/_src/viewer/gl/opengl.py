@@ -107,6 +107,7 @@ class RenderVertex:
     pos: wp.vec3
     normal: wp.vec3
     uv: wp.vec2
+    color: wp.vec4
 
 
 @wp.struct
@@ -120,17 +121,22 @@ def fill_vertex_data(
     points: wp.array[wp.vec3],
     normals: wp.array[wp.vec3],
     uvs: wp.array[wp.vec2],
+    colors: wp.array[wp.vec4],
     vertices: wp.array[RenderVertex],
 ):
     tid = wp.tid()
 
     vertices[tid].pos = points[tid]
+    vertices[tid].color = wp.vec4(1.0, 1.0, 1.0, 1.0)
 
     if normals:
         vertices[tid].normal = normals[tid]
 
     if uvs:
         vertices[tid].uv = uvs[tid]
+
+    if colors:
+        vertices[tid].color = colors[tid]
 
 
 @wp.kernel
@@ -175,7 +181,7 @@ class MeshGL:
         self.texture_id = None
 
         # Set up vertex attributes in the packed format the shaders expect
-        self.vertex_byte_size = 12 + 12 + 8
+        self.vertex_byte_size = 12 + 12 + 8 + 16
         self.index_byte_size = 4
 
         self.vbo_size = self.vertex_byte_size * num_points
@@ -208,6 +214,10 @@ class MeshGL:
         gl.glVertexAttribPointer(2, 2, gl.GL_FLOAT, gl.GL_FALSE, self.vertex_byte_size, ctypes.c_void_p(6 * 4))
         gl.glEnableVertexAttribArray(2)
 
+        # vertex colors (location 9)
+        gl.glVertexAttribPointer(9, 4, gl.GL_FLOAT, gl.GL_FALSE, self.vertex_byte_size, ctypes.c_void_p(8 * 4))
+        gl.glEnableVertexAttribArray(9)
+
         # set constant instance transform
         gl.glDisableVertexAttribArray(3)
         gl.glDisableVertexAttribArray(4)
@@ -215,7 +225,6 @@ class MeshGL:
         gl.glDisableVertexAttribArray(6)
         gl.glDisableVertexAttribArray(7)
         gl.glDisableVertexAttribArray(8)
-        gl.glDisableVertexAttribArray(9)
 
         #   column 0  (1,0,0,0)
         gl.glVertexAttrib4f(3, 1.0, 0.0, 0.0, 0.0)
@@ -229,8 +238,10 @@ class MeshGL:
         gl.glBindVertexArray(0)
 
         # Per-mesh albedo and material (applied in render()).
-        self.color = (0.7, 0.5, 0.3)
+        self.color = (0.7, 0.5, 0.3, 1.0)
         self.material = (0.5, 0.0, 0.0, 0.0)
+        self.has_vertex_alpha = False
+        self.transparent_override = None
 
         # Create CUDA-GL interop buffer for efficient updates
         if ENABLE_CUDA_INTEROP and self.device.is_cuda:
@@ -238,6 +249,16 @@ class MeshGL:
         else:
             self.vertex_cuda_buffer = None
         self._points = None
+
+    @property
+    def has_transparency(self):
+        if self.transparent_override is not None:
+            return self.transparent_override
+        return self.has_vertex_alpha or self.color[3] < 0.999
+
+    @property
+    def cast_shadow(self):
+        return not self.has_transparency
 
     def destroy(self):
         """Clean up OpenGL resources."""
@@ -255,7 +276,7 @@ class MeshGL:
             # Ignore any errors if the GL context has already been torn down
             pass
 
-    def update(self, points, indices, normals, uvs, texture=None):
+    def update(self, points, indices, normals, uvs, texture=None, colors=None):
         """Update vertex positions in the VBO.
 
         Args:
@@ -268,6 +289,7 @@ class MeshGL:
             raise RuntimeError("Number of points does not match")
 
         self._points = points
+        self.has_vertex_alpha = colors is not None
 
         # only update indices the first time (no topology changes)
         if self.indices is None:
@@ -289,7 +311,7 @@ class MeshGL:
         wp.launch(
             fill_vertex_data,
             dim=len(self.vertices),
-            inputs=[points, normals, uvs],
+            inputs=[points, normals, uvs, colors],
             outputs=[self.vertices],
             device=self.device,
         )
@@ -350,6 +372,11 @@ class MeshGL:
     def render(self):
         if not self.hidden:
             gl = RendererGL.gl
+            transparent = self.has_transparency
+
+            if transparent:
+                gl.glEnable(gl.GL_BLEND)
+                gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
 
             if self.backface_culling:
                 gl.glEnable(gl.GL_CULL_FACE)
@@ -363,12 +390,15 @@ class MeshGL:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, RendererGL.get_fallback_texture())
 
             # Set per-mesh albedo and material (global state, not per-VAO).
-            gl.glVertexAttrib3f(7, *self.color)
+            gl.glVertexAttrib4f(7, *self.color)
             gl.glVertexAttrib4f(8, *self.material)
 
             gl.glBindVertexArray(self.vao)
             gl.glDrawElements(gl.GL_TRIANGLES, self.num_indices, gl.GL_UNSIGNED_INT, None)
             gl.glBindVertexArray(0)
+
+            if transparent:
+                gl.glDisable(gl.GL_BLEND)
 
 
 class LinesGL:
@@ -658,14 +688,15 @@ def update_vbo_transforms_from_points(
 class MeshInstancerGL:
     """
     Handles instanced rendering for a mesh.
-    Note the vertices must be in the 8-dimensional format:
-        [3D point, 3D normal, UV texture coordinates]
+    Note the vertices are packed as:
+        [3D point, 3D normal, UV texture coordinates, RGBA color]
     """
 
     def __init__(self, num_instances, mesh):
         self.mesh = mesh
         self.device = mesh.device
         self.hidden = False
+        self._cast_shadow_override = None
         self.instance_transform_buffer = None
         self.instance_color_buffer = None
         self.instance_material_buffer = None
@@ -743,6 +774,17 @@ class MeshInstancerGL:
         )
         gl.glEnableVertexAttribArray(2)
 
+        # vertex colors
+        gl.glVertexAttribPointer(
+            9,
+            4,
+            gl.GL_FLOAT,
+            gl.GL_FALSE,
+            self.mesh.vertex_byte_size,
+            ctypes.c_void_p(8 * 4),
+        )
+        gl.glEnableVertexAttribArray(9)
+
         self.transform_byte_size = 16 * 4  # sizeof(mat44)
         self.color_byte_size = 3 * 4  # sizeof(vec3)
         self.material_byte_size = 4 * 4  # sizeof(vec4)
@@ -758,7 +800,7 @@ class MeshInstancerGL:
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_transform_buffer)
         gl.glBufferData(gl.GL_ARRAY_BUFFER, self.instance_transform_buffer_size, None, gl.GL_DYNAMIC_DRAW)
 
-        # we can only send vec4s to the shader, so we need to split the instance transforms matrix into its column vectors
+        # Split the instance transform matrix into vec4 columns for the shader.
         for i in range(4):
             gl.glVertexAttribPointer(
                 3 + i, 4, gl.GL_FLOAT, gl.GL_FALSE, self.transform_byte_size, ctypes.c_void_p(i * 16)
@@ -924,6 +966,11 @@ class MeshInstancerGL:
         if self.hidden:
             return
 
+        transparent = self.mesh.has_transparency
+        if transparent:
+            gl.glEnable(gl.GL_BLEND)
+            gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+
         if self.mesh.backface_culling:
             gl.glEnable(gl.GL_CULL_FACE)
         else:
@@ -940,6 +987,23 @@ class MeshInstancerGL:
             gl.GL_TRIANGLES, self.mesh.num_indices, gl.GL_UNSIGNED_INT, None, self.active_instances
         )
         gl.glBindVertexArray(0)
+
+        if transparent:
+            gl.glDisable(gl.GL_BLEND)
+
+    @property
+    def has_transparency(self):
+        return self.mesh.has_transparency
+
+    @property
+    def cast_shadow(self):
+        if self._cast_shadow_override is not None:
+            return self._cast_shadow_override
+        return self.mesh.cast_shadow
+
+    @cast_shadow.setter
+    def cast_shadow(self, value):
+        self._cast_shadow_override = bool(value)
 
 
 class RendererGL:
@@ -1928,9 +1992,21 @@ class RendererGL:
         check_gl_error()
 
     def _draw_objects(self, objects):
-        for o in objects.values():
-            if hasattr(o, "render"):
+        gl = RendererGL.gl
+        renderable = [o for o in objects.values() if hasattr(o, "render")]
+
+        for o in renderable:
+            if not getattr(o, "has_transparency", False):
                 o.render()
+
+        transparent = [o for o in renderable if getattr(o, "has_transparency", False)]
+        if transparent:
+            gl.glDepthMask(False)
+            try:
+                for o in transparent:
+                    o.render()
+            finally:
+                gl.glDepthMask(True)
 
         check_gl_error()
 

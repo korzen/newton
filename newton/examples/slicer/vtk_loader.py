@@ -1,22 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Loader for legacy VTK ``UNSTRUCTURED_GRID`` files.
+"""Loader for legacy VTK ``UNSTRUCTURED_GRID`` and ``POLYDATA`` files.
 
 The slicer example family ships several volumetric/anatomy meshes authored in
 the legacy VTK 3.0 ASCII format (see
 https://docs.vtk.org/en/latest/vtk_file_formats/vtk_legacy_file_format.html).
 This module provides a single-pass, dependency-free parser for that format
 plus a few convenience extractors for the cell types we actually need
-downstream (triangles, tetrahedra, hexahedra, and boundary-triangle
-extraction for hex meshes).
+downstream (surface polygons, triangles, tetrahedra, hexahedra, and
+boundary-triangle extraction for hex meshes).
 
 Only the subset of the legacy format we encounter in this repository is
 supported: ASCII ``UNSTRUCTURED_GRID`` datasets with ``POINTS``, ``CELLS``,
-``CELL_TYPES``, and ``POINT_DATA``/``CELL_DATA`` containing ``SCALARS``,
-``VECTORS``, ``NORMALS``, or ``COLOR_SCALARS`` attribute blocks. Binary
-encodings, ``FIELD`` data, structured datasets, and other variants raise
-:class:`ValueError`.
+``CELL_TYPES``; ASCII ``POLYDATA`` datasets with ``POINTS``, ``POLYGONS``,
+and/or ``TRIANGLE_STRIPS``; and ``POINT_DATA``/``CELL_DATA`` containing
+``SCALARS``, ``VECTORS``, ``NORMALS``, or ``COLOR_SCALARS`` attribute blocks.
+Binary encodings, ``FIELD`` data, structured datasets, and other variants
+raise :class:`ValueError`.
 """
 
 from __future__ import annotations
@@ -43,6 +44,9 @@ __all__ = [
     "VTK_VOXEL",
     "VTK_WEDGE",
     "VtkUnstructuredGrid",
+    "VtkPolyData",
+    "load_vtk_polydata",
+    "load_vtk_polygon_data",
     "load_vtk_unstructured_grid",
 ]
 
@@ -238,6 +242,149 @@ class VtkUnstructuredGrid:
         return np.asarray(triangles, dtype=np.int32)
 
 
+@dataclass
+class VtkPolyData:
+    """Parsed contents of a legacy ASCII VTK ``POLYDATA`` file.
+
+    Polygon connectivity is stored in compact offset/index arrays to avoid
+    millions of tiny Python objects for large Slicer anatomy files.
+
+    Attributes:
+        points: Vertex positions, shape ``(num_points, 3)``, float32.
+        polygon_offsets: Prefix-sum offsets into ``polygon_indices``, shape
+            ``(num_polygons + 1,)``, int32.
+        polygon_indices: Flattened polygon vertex indices, int32.
+        triangle_strip_offsets: Prefix-sum offsets into
+            ``triangle_strip_indices``, shape ``(num_strips + 1,)``, int32.
+        triangle_strip_indices: Flattened triangle-strip vertex indices,
+            int32.
+        point_data: Mapping from attribute name to point-attribute array.
+        cell_data: Mapping from attribute name to cell-attribute array.
+        header: The free-form header line from the file (line 2).
+    """
+
+    points: np.ndarray
+    polygon_offsets: np.ndarray
+    polygon_indices: np.ndarray
+    triangle_strip_offsets: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.int32))
+    triangle_strip_indices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int32))
+    point_data: dict[str, np.ndarray] = field(default_factory=dict)
+    cell_data: dict[str, np.ndarray] = field(default_factory=dict)
+    header: str = ""
+
+    @property
+    def num_points(self) -> int:
+        return int(self.points.shape[0])
+
+    @property
+    def num_polygons(self) -> int:
+        return max(int(self.polygon_offsets.shape[0]) - 1, 0)
+
+    @property
+    def num_triangle_strips(self) -> int:
+        return max(int(self.triangle_strip_offsets.shape[0]) - 1, 0)
+
+    @property
+    def num_cells(self) -> int:
+        return self.num_polygons + self.num_triangle_strips
+
+    def polygon_sizes(self) -> np.ndarray:
+        """Return the number of vertices in each polygon."""
+        return np.diff(self.polygon_offsets)
+
+    def triangle_indices(self) -> np.ndarray:
+        """Return a ``(num_triangles, 3)`` int32 array of triangle indices.
+
+        Polygons with more than three vertices are fan-triangulated. Triangle
+        strips are expanded using the alternating winding convention from the
+        VTK legacy format.
+        """
+        parts: list[np.ndarray] = []
+
+        polygon_triangles = self._polygon_triangle_indices()
+        if polygon_triangles.size > 0:
+            parts.append(polygon_triangles)
+
+        strip_triangles = self._triangle_strip_indices()
+        if strip_triangles.size > 0:
+            parts.append(strip_triangles)
+
+        if not parts:
+            return np.empty((0, 3), dtype=np.int32)
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate(parts, axis=0)
+
+    def to_mesh(self, *, normals_name: str | None = "Normals") -> newton.Mesh:
+        """Build a :class:`newton.Mesh` from the polygon surface.
+
+        Args:
+            normals_name: Optional point-data key to pass as vertex normals
+                when present. Set to ``None`` to ignore loaded normals.
+
+        Raises:
+            ValueError: If no polygon or triangle-strip surface can be
+                triangulated.
+        """
+        triangles = self.triangle_indices()
+        if triangles.size == 0:
+            raise ValueError("No triangle surface could be extracted from VTK POLYDATA.")
+
+        normals = None
+        if normals_name is not None:
+            normals = self.point_data.get(normals_name)
+
+        return newton.Mesh(
+            vertices=self.points,
+            indices=triangles.reshape(-1).astype(np.int32),
+            normals=normals,
+            compute_inertia=False,
+        )
+
+    def _polygon_triangle_indices(self) -> np.ndarray:
+        sizes = self.polygon_sizes()
+        if sizes.size == 0:
+            return np.empty((0, 3), dtype=np.int32)
+        if np.all(sizes == 3):
+            return self.polygon_indices.reshape(-1, 3)
+
+        triangle_count = int(np.maximum(sizes - 2, 0).sum())
+        triangles = np.empty((triangle_count, 3), dtype=np.int32)
+        row = 0
+        for polygon_idx, size in enumerate(sizes):
+            size = int(size)
+            if size < 3:
+                continue
+            start = int(self.polygon_offsets[polygon_idx])
+            polygon = self.polygon_indices[start : start + size]
+            for i in range(1, size - 1):
+                triangles[row] = (polygon[0], polygon[i], polygon[i + 1])
+                row += 1
+        return triangles
+
+    def _triangle_strip_indices(self) -> np.ndarray:
+        sizes = np.diff(self.triangle_strip_offsets)
+        if sizes.size == 0:
+            return np.empty((0, 3), dtype=np.int32)
+
+        triangle_count = int(np.maximum(sizes - 2, 0).sum())
+        triangles = np.empty((triangle_count, 3), dtype=np.int32)
+        row = 0
+        for strip_idx, size in enumerate(sizes):
+            size = int(size)
+            if size < 3:
+                continue
+            start = int(self.triangle_strip_offsets[strip_idx])
+            strip = self.triangle_strip_indices[start : start + size]
+            for i in range(size - 2):
+                if i % 2 == 0:
+                    triangles[row] = (strip[i], strip[i + 1], strip[i + 2])
+                else:
+                    triangles[row] = (strip[i + 1], strip[i], strip[i + 2])
+                row += 1
+        return triangles
+
+
 # ----------------------------------------------------------------------
 # Top-level parser
 # ----------------------------------------------------------------------
@@ -259,15 +406,7 @@ def load_vtk_unstructured_grid(path: str | Path) -> VtkUnstructuredGrid:
     path = Path(path)
     tokens = path.read_text(encoding="utf-8").replace(",", " ").split()
 
-    cursor = _expect_keyword(tokens, 0, "#")
-    # Format identifier "# vtk DataFile Version X.Y".
-    while cursor < len(tokens) and tokens[cursor] != "ASCII" and tokens[cursor] != "BINARY":
-        cursor += 1
-    if cursor >= len(tokens):
-        raise ValueError(f"VTK file '{path}' does not declare ASCII or BINARY format.")
-    if tokens[cursor].upper() == "BINARY":
-        raise ValueError(f"Only legacy ASCII VTK files are supported, got BINARY in '{path}'.")
-    cursor += 1
+    cursor = _read_legacy_ascii_header(tokens, path)
 
     dataset_idx = _find_keyword(tokens, "DATASET", cursor)
     if dataset_idx + 1 >= len(tokens) or tokens[dataset_idx + 1].upper() != "UNSTRUCTURED_GRID":
@@ -296,30 +435,106 @@ def load_vtk_unstructured_grid(path: str | Path) -> VtkUnstructuredGrid:
             # we don't model.
             cursor += 1
 
-    # The header is the line following "# vtk DataFile Version X.Y", but we
-    # only kept tokens. Reconstruct from the raw file head.
-    header_line = ""
-    try:
-        with path.open(encoding="utf-8") as fh:
-            for _ in range(1):
-                fh.readline()
-            header_line = fh.readline().strip()
-    except OSError:
-        pass
-
     return VtkUnstructuredGrid(
         points=points,
         cells=cells,
         cell_types=cell_types,
         point_data=point_data,
         cell_data=cell_data,
-        header=header_line,
+        header=_read_header_line(path),
     )
+
+
+def load_vtk_polydata(path: str | Path) -> VtkPolyData:
+    """Parse a legacy ASCII VTK ``POLYDATA`` file.
+
+    Args:
+        path: Filesystem path to the ``.vtk`` file.
+
+    Returns:
+        A populated :class:`VtkPolyData`.
+
+    Raises:
+        ValueError: If the file is not a legacy ASCII ``POLYDATA`` dataset
+            or if a recognized section is malformed.
+    """
+    path = Path(path)
+    tokens = path.read_text(encoding="utf-8").replace(",", " ").split()
+
+    cursor = _read_legacy_ascii_header(tokens, path)
+
+    dataset_idx = _find_keyword(tokens, "DATASET", cursor)
+    if dataset_idx + 1 >= len(tokens) or tokens[dataset_idx + 1].upper() != "POLYDATA":
+        raise ValueError(f"Expected DATASET POLYDATA in '{path}'.")
+    cursor = dataset_idx + 2
+
+    points, cursor = _read_points(tokens, cursor, path)
+
+    polygon_offsets = np.zeros(1, dtype=np.int32)
+    polygon_indices = np.empty(0, dtype=np.int32)
+    triangle_strip_offsets = np.zeros(1, dtype=np.int32)
+    triangle_strip_indices = np.empty(0, dtype=np.int32)
+    point_data: dict[str, np.ndarray] = {}
+    cell_data: dict[str, np.ndarray] = {}
+
+    while cursor < len(tokens):
+        token = tokens[cursor].upper()
+        if token == "POLYGONS":
+            polygon_offsets, polygon_indices, cursor = _read_connectivity_list(tokens, cursor, path, "POLYGONS")
+        elif token == "TRIANGLE_STRIPS":
+            triangle_strip_offsets, triangle_strip_indices, cursor = _read_connectivity_list(
+                tokens, cursor, path, "TRIANGLE_STRIPS"
+            )
+        elif token in ("VERTICES", "LINES"):
+            cursor = _skip_connectivity_list(tokens, cursor, path, token)
+        elif token == "POINT_DATA":
+            cursor = _read_data_section(tokens, cursor, count=int(tokens[cursor + 1]), dest=point_data)
+        elif token == "CELL_DATA":
+            cursor = _read_data_section(tokens, cursor, count=int(tokens[cursor + 1]), dest=cell_data)
+        else:
+            cursor += 1
+
+    return VtkPolyData(
+        points=points,
+        polygon_offsets=polygon_offsets,
+        polygon_indices=polygon_indices,
+        triangle_strip_offsets=triangle_strip_offsets,
+        triangle_strip_indices=triangle_strip_indices,
+        point_data=point_data,
+        cell_data=cell_data,
+        header=_read_header_line(path),
+    )
+
+
+def load_vtk_polygon_data(path: str | Path) -> VtkPolyData:
+    """Alias for :func:`load_vtk_polydata`."""
+    return load_vtk_polydata(path)
 
 
 # ----------------------------------------------------------------------
 # Internals
 # ----------------------------------------------------------------------
+
+
+def _read_legacy_ascii_header(tokens: list[str], path: Path) -> int:
+    cursor = _expect_keyword(tokens, 0, "#")
+    # Format identifier "# vtk DataFile Version X.Y".
+    while cursor < len(tokens) and tokens[cursor].upper() not in ("ASCII", "BINARY"):
+        cursor += 1
+    if cursor >= len(tokens):
+        raise ValueError(f"VTK file '{path}' does not declare ASCII or BINARY format.")
+    if tokens[cursor].upper() == "BINARY":
+        raise ValueError(f"Only legacy ASCII VTK files are supported, got BINARY in '{path}'.")
+    return cursor + 1
+
+
+def _read_header_line(path: Path) -> str:
+    try:
+        with path.open(encoding="utf-8") as fh:
+            fh.readline()
+            return fh.readline().strip()
+    except OSError:
+        return ""
 
 
 def _expect_keyword(tokens: list[str], idx: int, keyword: str) -> int:
@@ -377,6 +592,66 @@ def _read_cells(
     return tuple(cells), end
 
 
+def _read_connectivity_list(
+    tokens: list[str], cursor: int, path: Path, section: str
+) -> tuple[np.ndarray, np.ndarray, int]:
+    if cursor >= len(tokens) or tokens[cursor].upper() != section:
+        raise ValueError(f"Expected {section} at token {cursor} in '{path}'.")
+
+    item_count = int(tokens[cursor + 1])
+    list_size = int(tokens[cursor + 2])
+    start = cursor + 3
+    end = start + list_size
+    if end > len(tokens):
+        raise ValueError(f"{section} section in '{path}' ended before all connectivity was read.")
+
+    raw = np.asarray(tokens[start:end], dtype=np.int32)
+    if item_count == 0:
+        if list_size != 0:
+            raise ValueError(f"{section} list size mismatch in '{path}': expected 0, got {list_size}.")
+        return np.zeros(1, dtype=np.int32), np.empty(0, dtype=np.int32), end
+
+    first_size = int(raw[0])
+    stride = first_size + 1
+    if first_size >= 0 and stride > 0 and list_size == item_count * stride and np.all(raw[::stride] == first_size):
+        offsets = np.arange(0, item_count * first_size + 1, first_size, dtype=np.int32)
+        indices = raw.reshape(item_count, stride)[:, 1:].reshape(-1).astype(np.int32, copy=False)
+        return offsets, indices, end
+
+    offsets = np.empty(item_count + 1, dtype=np.int32)
+    indices = np.empty(max(list_size - item_count, 0), dtype=np.int32)
+    offsets[0] = 0
+    pos = 0
+    out_pos = 0
+    for item_id in range(item_count):
+        if pos >= list_size:
+            raise ValueError(f"{section} section in '{path}' ended before item {item_id}.")
+        size = int(raw[pos])
+        pos += 1
+        item_end = pos + size
+        if size < 0 or item_end > list_size:
+            raise ValueError(f"{section} section in '{path}' ended inside item {item_id}.")
+        indices[out_pos : out_pos + size] = raw[pos:item_end]
+        out_pos += size
+        offsets[item_id + 1] = out_pos
+        pos = item_end
+
+    if pos != list_size:
+        raise ValueError(f"{section} list size mismatch in '{path}': declared {list_size}, consumed {pos}.")
+
+    return offsets, indices[:out_pos], end
+
+
+def _skip_connectivity_list(tokens: list[str], cursor: int, path: Path, section: str) -> int:
+    if cursor >= len(tokens) or tokens[cursor].upper() != section:
+        raise ValueError(f"Expected {section} at token {cursor} in '{path}'.")
+    list_size = int(tokens[cursor + 2])
+    end = cursor + 3 + list_size
+    if end > len(tokens):
+        raise ValueError(f"{section} section in '{path}' ended before all connectivity was read.")
+    return end
+
+
 def _read_cell_types(
     tokens: list[str], cursor: int, path: Path, expected: int
 ) -> tuple[np.ndarray, int]:
@@ -396,7 +671,20 @@ def _read_cell_types(
 
 # Top-level attribute keywords that close the current POINT_DATA / CELL_DATA
 # section (or otherwise mark a new region of the file).
-_SECTION_TERMINATORS = frozenset({"POINT_DATA", "CELL_DATA", "DATASET", "POINTS", "CELLS", "CELL_TYPES"})
+_SECTION_TERMINATORS = frozenset(
+    {
+        "POINT_DATA",
+        "CELL_DATA",
+        "DATASET",
+        "POINTS",
+        "CELLS",
+        "CELL_TYPES",
+        "VERTICES",
+        "LINES",
+        "POLYGONS",
+        "TRIANGLE_STRIPS",
+    }
+)
 
 
 def _read_data_section(

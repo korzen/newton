@@ -217,9 +217,11 @@ class ViewerRerun(ViewerBase):
         texture: np.ndarray | str | None = None,
         hidden: bool = False,
         backface_culling: bool = True,
-        color: tuple[float, float, float] | None = None,
+        color: tuple[float, float, float] | tuple[float, float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        vertex_colors: wp.array[wp.vec4] | None = None,
+        transparent: bool | None = None,
     ):
         """
         Log a mesh to rerun for visualization.
@@ -233,18 +235,21 @@ class ViewerRerun(ViewerBase):
             texture: Optional texture path/URL or image array.
             hidden: Whether the mesh is hidden.
             backface_culling: Whether to enable backface culling (unused).
-            color: Optional base color as an RGB tuple with values in
+            color: Optional base color as an RGB or RGBA tuple with values in
                 [0, 1]. Used when no texture is provided.
             roughness: Surface roughness in ``[0, 1]``. ``0`` is perfectly
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            vertex_colors: Optional per-vertex RGBA color multipliers.
+            transparent: Optional override for transparent rendering.
         """
         if not hidden:
             assert isinstance(points, wp.array)
             assert isinstance(indices, wp.array)
             assert normals is None or isinstance(normals, wp.array)
             assert uvs is None or isinstance(uvs, wp.array)
+            assert vertex_colors is None or isinstance(vertex_colors, wp.array)
 
         # Convert to numpy arrays
         points_np = self._to_numpy(points).astype(np.float32)
@@ -266,6 +271,7 @@ class ViewerRerun(ViewerBase):
             normals_np = self._to_numpy(normals)
 
         uvs_np = self._to_numpy(uvs).astype(np.float32) if uvs is not None else None
+        vertex_colors_np = self._to_numpy(vertex_colors).astype(np.float32) if vertex_colors is not None else None
         texture_image = self._prepare_texture(texture)
 
         if uvs_np is not None and len(uvs_np) != len(points_np):
@@ -273,6 +279,8 @@ class ViewerRerun(ViewerBase):
             texture_image = None
         if texture_image is not None and uvs_np is None:
             texture_image = None
+        if vertex_colors_np is not None and len(vertex_colors_np) != len(points_np):
+            vertex_colors_np = None
 
         if uvs_np is not None:
             uvs_np = self._flip_uvs_for_rerun(uvs_np)
@@ -294,6 +302,7 @@ class ViewerRerun(ViewerBase):
             "texture_image": texture_image,
             "texture_buffer": texture_buffer,
             "texture_format": texture_format,
+            "vertex_colors": vertex_colors_np,
         }
 
         if hidden:
@@ -311,6 +320,8 @@ class ViewerRerun(ViewerBase):
             mesh_kwargs["albedo_texture_format"] = texture_format
         elif texture_image is not None and self._mesh3d_supports("albedo_texture"):
             mesh_kwargs["albedo_texture"] = texture_image
+        if vertex_colors_np is not None and self._mesh3d_supports("vertex_colors"):
+            mesh_kwargs["vertex_colors"] = vertex_colors_np
 
         # Log the mesh as a static asset
         mesh_3d = self._call_rr_constructor(rr.Mesh3D, **mesh_kwargs)

@@ -214,9 +214,11 @@ class ViewerUSD(ViewerBase):
         texture: np.ndarray | str | None = None,
         hidden: bool = False,
         backface_culling: bool = True,
-        color: tuple[float, float, float] | None = None,
+        color: tuple[float, float, float] | tuple[float, float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        vertex_colors: wp.array[wp.vec4] | None = None,
+        transparent: bool | None = None,
     ):
         """
         Create a USD mesh prototype from vertex and index data.
@@ -230,12 +232,14 @@ class ViewerUSD(ViewerBase):
             texture: Optional texture path/URL or image array.
             hidden: If True, mesh will be hidden.
             backface_culling: If True, enable backface culling.
-            color: Optional base color as an RGB tuple with values in
+            color: Optional base color as an RGB or RGBA tuple with values in
                 [0, 1]. Used when no texture is provided.
             roughness: Surface roughness in ``[0, 1]``. ``0`` is perfectly
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            vertex_colors: Optional per-vertex RGBA color multipliers.
+            transparent: Optional override for transparent rendering.
         """
 
         # Convert warp arrays to numpy
@@ -268,6 +272,20 @@ class ViewerUSD(ViewerBase):
         if uvs is not None:
             # TODO: Implement UV support for USD meshes
             pass
+
+        if vertex_colors is not None:
+            vertex_colors_np = vertex_colors.numpy().astype(np.float32)
+            if vertex_colors_np.shape[0] == points_np.shape[0]:
+                primvars = UsdGeom.PrimvarsAPI(mesh_prim)
+                display_color = primvars.CreatePrimvar(
+                    "displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex
+                )
+                display_color.Set(vertex_colors_np[:, :3], self._frame_index)
+                if vertex_colors_np.shape[1] > 3:
+                    display_opacity = primvars.CreatePrimvar(
+                        "displayOpacity", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex
+                    )
+                    display_opacity.Set(vertex_colors_np[:, 3], self._frame_index)
 
         # how to hide the prototype mesh but not the instances in USD?
         mesh_prim.GetVisibilityAttr().Set("inherited" if not hidden else "invisible", self._frame_index)

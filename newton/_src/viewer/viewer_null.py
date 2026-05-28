@@ -67,9 +67,11 @@ class ViewerNull(ViewerBase):
         texture: np.ndarray | str | None = None,
         hidden: bool = False,
         backface_culling: bool = True,
-        color: tuple[float, float, float] | None = None,
+        color: tuple[float, float, float] | tuple[float, float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        vertex_colors: wp.array[wp.vec4] | None = None,
+        transparent: bool | None = None,
     ):
         """
         No-op implementation for logging a mesh.
@@ -83,12 +85,14 @@ class ViewerNull(ViewerBase):
             texture: Optional texture path/URL or image array.
             hidden: Whether the mesh is hidden.
             backface_culling: Whether to enable backface culling.
-            color: Optional base color as an RGB tuple with values in
+            color: Optional base color as an RGB or RGBA tuple with values in
                 [0, 1]. Used when no texture is provided.
             roughness: Surface roughness in ``[0, 1]``. ``0`` is perfectly
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            vertex_colors: Optional per-vertex RGBA color multipliers.
+            transparent: Optional override for transparent rendering.
         """
         pass
 
