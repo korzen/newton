@@ -720,6 +720,7 @@ class Example:
         self._gravity_key_was_down = False
         self._control_handle_key_was_down = False
         self._reset_offset_key_was_down = False
+        self._camera_input_space_key_was_down = False
         self._gravity_enabled = True
         self._reset_device_key_was_down = False
         self._compress_device_key_was_down = False
@@ -1215,6 +1216,16 @@ class Example:
         state = "enabled" if self.minimou_control_enabled else "disabled"
         print(f"Control Handle {state}.")
 
+    def _set_minimou_workspace_follows_camera(self, enabled: bool):
+        self.minimou_workspace_follows_camera = bool(enabled)
+        if self.minimou_control_enabled:
+            self._request_minimou_takeover()
+
+    def _toggle_minimou_camera_input_space(self):
+        self._set_minimou_workspace_follows_camera(not self.minimou_workspace_follows_camera)
+        state = "enabled" if self.minimou_workspace_follows_camera else "disabled"
+        print(f"Camera Input Space {state}.")
+
     def _request_minimou_takeover(self):
         self.minimou_takeover_requested = True
         self.minimou_anchor_device_transform = None
@@ -1249,7 +1260,7 @@ class Example:
             self.minimou_status = "Tracking" if self.minimou_control_enabled else "Connected"
         return sample
 
-    def _camera_workspace_transform(self) -> wp.transform | None:
+    def _camera_input_space_transform(self) -> wp.transform | None:
         camera = getattr(self.viewer, "camera", None)
         if camera is None:
             return None
@@ -1288,32 +1299,42 @@ class Example:
             rotation,
         )
 
-    def _minimou_workspace_transform(self) -> wp.transform:
+    def _minimou_rotation_offset(self) -> wp.quat:
         roll, pitch, yaw = (math.radians(float(value)) for value in self.minimou_workspace_rot_offset_deg)
-        workspace = wp.transform(
-            wp.vec3(
-                float(self.minimou_workspace_pos_offset[0]),
-                float(self.minimou_workspace_pos_offset[1]),
-                float(self.minimou_workspace_pos_offset[2]),
-            ),
-            wp.quat_rpy(roll, pitch, yaw),
-        )
-        if not self.minimou_workspace_follows_camera:
-            return workspace
-
-        camera_transform = self._camera_workspace_transform()
-        if camera_transform is None:
-            return workspace
-        return wp.transform_multiply(camera_transform, workspace)
+        return wp.quat_rpy(roll, pitch, yaw)
 
     def _minimou_sample_transform(self, sample: dict) -> wp.transform:
         position = np.asarray(sample["position"], dtype=np.float32)
         rotation = np.asarray(sample["rotation"], dtype=np.float32)
-        device_transform = wp.transform(
-            wp.vec3(float(position[0]), float(position[1]), float(position[2])),
-            wp.quat(float(rotation[0]), float(rotation[1]), float(rotation[2]), float(rotation[3])),
+        local_position = wp.vec3(
+            float(position[0] + self.minimou_workspace_pos_offset[0]),
+            float(position[1] + self.minimou_workspace_pos_offset[1]),
+            float(position[2] + self.minimou_workspace_pos_offset[2]),
         )
-        return wp.transform_multiply(self._minimou_workspace_transform(), device_transform)
+        local_rotation = wp.mul(
+            wp.quat(float(rotation[0]), float(rotation[1]), float(rotation[2]), float(rotation[3])),
+            self._minimou_rotation_offset(),
+        )
+
+        if not self.minimou_workspace_follows_camera:
+            return wp.transform(local_position, local_rotation)
+
+        camera_transform = self._camera_input_space_transform()
+        if camera_transform is None:
+            return wp.transform(local_position, local_rotation)
+
+        _camera_position, camera_rotation = self._transform_components(camera_transform)
+        world_position = wp.transform_point(camera_transform, local_position)
+        world_rotation = quat_mul_xyzw(quat_inverse_xyzw(camera_rotation), local_rotation)
+        return wp.transform(
+            world_position,
+            wp.quat(
+                float(world_rotation[0]),
+                float(world_rotation[1]),
+                float(world_rotation[2]),
+                float(world_rotation[3]),
+            ),
+        )
 
     @staticmethod
     def _transform_components(transform: wp.transform) -> tuple[np.ndarray, np.ndarray]:
@@ -2086,6 +2107,11 @@ class Example:
             self._reset_minimou_handle_offset()
         self._reset_offset_key_was_down = reset_offset_down
 
+        camera_input_space_down = bool(self.viewer.is_key_down("x"))
+        if camera_input_space_down and not self._camera_input_space_key_was_down:
+            self._toggle_minimou_camera_input_space()
+        self._camera_input_space_key_was_down = camera_input_space_down
+
     def _toggle_gravity(self):
         self._gravity_enabled = not self._gravity_enabled
         if self._gravity_enabled:
@@ -2321,9 +2347,7 @@ class Example:
 
         changed, follows_camera = ui.checkbox("Camera Input Space", self.minimou_workspace_follows_camera)
         if changed:
-            self.minimou_workspace_follows_camera = bool(follows_camera)
-            if self.minimou_control_enabled:
-                self._request_minimou_takeover()
+            self._set_minimou_workspace_follows_camera(bool(follows_camera))
 
         if self.minimou_control_enabled and ui.button("Reset Offset"):
             self._reset_minimou_handle_offset()
