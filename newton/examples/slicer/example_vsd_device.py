@@ -8,7 +8,7 @@
 # cells and simulates it as a volumetric soft body.
 #
 # Command: uv run -m newton.examples vsd_device
-#
+# Heart.vtk: uv run newton/examples/slicer/example_vsd_device.py  --scale 0.33 --anatomy-scale 0.5 --offset 0 0 1 --solver fem
 ###########################################################################
 
 from __future__ import annotations
@@ -28,7 +28,8 @@ from newton.examples.slicer.vtk_loader import load_vtk_polydata, load_vtk_unstru
 PARTICLE_ACTIVE = wp.constant(int(newton.ParticleFlags.ACTIVE))
 MESH_PATH = Path(__file__).resolve().parent / "vsd_device" / "mesh3.1.vtk"
 # VESSEL_MESH_PATH = Path(__file__).resolve().parent / "anatomy" / "RVOT1_Alterra_vessel.vtk"
-VESSEL_MESH_PATH = Path(__file__).resolve().parent / "anatomy" / "VSD from LV.vtk"
+#VESSEL_MESH_PATH = Path(__file__).resolve().parent / "anatomy" / "VSD from LV.vtk"
+VESSEL_MESH_PATH = Path(__file__).resolve().parent / "anatomy" / "Heart.vtk"
 DEFAULT_DEVICE_POSE_SLOTS_PATH = Path.home() / ".cache" / "newton" / "vsd_device_pose_slots.json"
 VESSEL_CONTACT_RADIUS_MIN = 0.0
 VESSEL_CONTACT_RADIUS_MAX = 0.2
@@ -793,6 +794,7 @@ class Example:
         self.minimou_takeover_requested = True
         self.minimou_anchor_device_transform: wp.transform | None = None
         self.minimou_anchor_handle_transform: wp.transform | None = None
+        self.minimou_anchor_camera_transform: wp.transform | None = None
         self.show_minimou_device_frame = True
         self._minimou_enable_on_start = bool(args.minimou_enabled or args.minimou_power or args.minimou_control)
 
@@ -1170,6 +1172,7 @@ class Example:
         controller, self.minimou_controller = self.minimou_controller, None
         self.minimou_anchor_device_transform = None
         self.minimou_anchor_handle_transform = None
+        self.minimou_anchor_camera_transform = None
         self.minimou_last_sample = None
         if controller is None:
             return
@@ -1201,6 +1204,7 @@ class Example:
         if not self.minimou_control_enabled:
             self.minimou_anchor_device_transform = None
             self.minimou_anchor_handle_transform = None
+            self.minimou_anchor_camera_transform = None
             return
 
         if not self.minimou_enabled:
@@ -1230,6 +1234,7 @@ class Example:
         self.minimou_takeover_requested = True
         self.minimou_anchor_device_transform = None
         self.minimou_anchor_handle_transform = None
+        self.minimou_anchor_camera_transform = None
         if self.minimou_control_enabled:
             self.minimou_status = "Takeover pending"
 
@@ -1341,9 +1346,23 @@ class Example:
         values = np.asarray(transform, dtype=np.float32)
         return values[:3], normalize_quat_xyzw(values[3:])
 
+    @classmethod
+    def _transform_point_np(cls, transform: wp.transform, point) -> np.ndarray:
+        position, rotation = cls._transform_components(transform)
+        return position + quat_rotate_xyzw(rotation, point)
+
+    @classmethod
+    def _inverse_transform_point_np(cls, transform: wp.transform, point) -> np.ndarray:
+        position, rotation = cls._transform_components(transform)
+        return quat_rotate_xyzw(quat_inverse_xyzw(rotation), np.asarray(point, dtype=np.float32) - position)
+
     def _capture_minimou_takeover(self, device_transform: wp.transform):
         self.minimou_anchor_device_transform = wp.transform(*device_transform)
         self.minimou_anchor_handle_transform = wp.transform(*self.device_transform_gizmo.transform)
+        if self.minimou_workspace_follows_camera:
+            self.minimou_anchor_camera_transform = self._camera_input_space_transform()
+        else:
+            self.minimou_anchor_camera_transform = None
         self.minimou_takeover_requested = False
         self.minimou_status = "Tracking"
 
@@ -1359,6 +1378,10 @@ class Example:
         self.device_transform_gizmo.transform[:] = device_transform
         self.minimou_anchor_device_transform = wp.transform(*device_transform)
         self.minimou_anchor_handle_transform = wp.transform(*device_transform)
+        if self.minimou_workspace_follows_camera:
+            self.minimou_anchor_camera_transform = self._camera_input_space_transform()
+        else:
+            self.minimou_anchor_camera_transform = None
         self.minimou_takeover_requested = False
         self.minimou_status = "Offset reset"
 
@@ -1384,6 +1407,20 @@ class Example:
         anchor_handle_pos, anchor_handle_rot = self._transform_components(self.minimou_anchor_handle_transform)
 
         target_pos = anchor_handle_pos + (device_pos - anchor_device_pos)
+        if self.minimou_workspace_follows_camera and self.minimou_anchor_camera_transform is not None:
+            camera_transform = self._camera_input_space_transform()
+            if camera_transform is not None:
+                anchor_device_camera_pos = self._inverse_transform_point_np(
+                    self.minimou_anchor_camera_transform,
+                    anchor_device_pos,
+                )
+                anchor_handle_camera_pos = self._inverse_transform_point_np(
+                    self.minimou_anchor_camera_transform,
+                    anchor_handle_pos,
+                )
+                device_camera_pos = self._inverse_transform_point_np(camera_transform, device_pos)
+                target_camera_pos = anchor_handle_camera_pos + (device_camera_pos - anchor_device_camera_pos)
+                target_pos = self._transform_point_np(camera_transform, target_camera_pos)
         target_rot = quat_mul_xyzw(quat_mul_xyzw(device_rot, quat_inverse_xyzw(anchor_device_rot)), anchor_handle_rot)
         self.device_transform_gizmo.transform[:] = wp.transform(
             wp.vec3(float(target_pos[0]), float(target_pos[1]), float(target_pos[2])),
