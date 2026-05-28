@@ -58,6 +58,8 @@ FEM_SOFT_CONTACT_FRICTION_MIN = 0.0
 FEM_SOFT_CONTACT_FRICTION_MAX = 2.0
 FEM_SOFT_CONTACT_MARGIN_MIN = 0.0
 FEM_SOFT_CONTACT_MARGIN_MAX = 0.1
+FEM_GLOBAL_DAMPING_MIN = 0.0
+FEM_GLOBAL_DAMPING_MAX = 100.0
 DEVICE_PARTICLE_RADIUS_MIN = 0.001
 DEVICE_PARTICLE_RADIUS_MAX = 0.08
 VESSEL_CONTACT_FORCE_COLOR_MAX_MIN = 1.0
@@ -81,7 +83,7 @@ PLACEMENT_AXIS_BAND_RADIUS_MAX = 0.2
 PLACEMENT_CLONE_STIFFNESS_MIN = 0.0
 PLACEMENT_CLONE_STIFFNESS_MAX = 1000.0
 PLACEMENT_CLONE_DAMPING_MIN = 0.0
-PLACEMENT_CLONE_DAMPING_MAX = 100.0
+PLACEMENT_CLONE_DAMPING_MAX = 1.0
 PLACEMENT_MAX_CLONE_FORCE_MIN = 0.0
 PLACEMENT_MAX_CLONE_FORCE_MAX = 5000.0
 MINIMOU_WORKSPACE_SCALE_MIN = 0.01
@@ -535,34 +537,46 @@ def update_device_clone_targets(
 
 
 @wp.kernel
-def apply_device_clone_target_forces(
-    particle_indices: wp.array[wp.int32],
+def update_device_clone_target_kinematics(
     rest_local_q: wp.array[wp.vec3],
     target_q: wp.array[wp.vec3],
+    target_qd: wp.array[wp.vec3],
     prev_target_q: wp.array[wp.vec3],
-    particle_q: wp.array[wp.vec3],
-    particle_qd: wp.array[wp.vec3],
-    particle_f: wp.array[wp.vec3],
     X_ws_buffer: wp.array[wp.transform],
     scale_buffer: wp.array[wp.vec3],
-    stiffness: float,
-    damping: float,
-    max_force: float,
     dt: float,
+    reset_previous: int,
 ):
     clone_idx = wp.tid()
     X_ws = X_ws_buffer[0]
     scale = scale_buffer[0]
     target = wp.transform_point(X_ws, wp.cw_mul(rest_local_q[clone_idx], scale))
     prev_target = prev_target_q[clone_idx]
+
     target_q[clone_idx] = target
+    if reset_previous != 0 or dt <= 0.0:
+        target_qd[clone_idx] = wp.vec3(0.0, 0.0, 0.0)
+    else:
+        target_qd[clone_idx] = (target - prev_target) / dt
+    prev_target_q[clone_idx] = target
 
-    target_vel = wp.vec3(0.0, 0.0, 0.0)
-    if dt > 0.0:
-        target_vel = (target - prev_target) / dt
 
+@wp.kernel
+def apply_device_clone_target_forces(
+    particle_indices: wp.array[wp.int32],
+    target_q: wp.array[wp.vec3],
+    target_qd: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_qd: wp.array[wp.vec3],
+    particle_f: wp.array[wp.vec3],
+    stiffness: float,
+    damping: float,
+    max_force: float,
+):
+    clone_idx = wp.tid()
     particle_idx = particle_indices[clone_idx]
-    force = stiffness * (target - particle_q[particle_idx]) + damping * (target_vel - particle_qd[particle_idx])
+    force = stiffness * (target_q[clone_idx] - particle_q[particle_idx])
+    force = force + damping * (target_qd[clone_idx] - particle_qd[particle_idx])
 
     force_len = wp.length(force)
     if max_force <= 0.0:
@@ -571,7 +585,6 @@ def apply_device_clone_target_forces(
         force = force * (max_force / force_len)
 
     particle_f[particle_idx] = particle_f[particle_idx] + force
-    prev_target_q[clone_idx] = target
 
 
 class StaticTriMeshParticleProjector:
@@ -705,6 +718,8 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self._needs_graph_recapture = False
         self._gravity_key_was_down = False
+        self._control_handle_key_was_down = False
+        self._reset_offset_key_was_down = False
         self._gravity_enabled = True
         self._reset_device_key_was_down = False
         self._compress_device_key_was_down = False
@@ -762,6 +777,7 @@ class Example:
         self.minimou_power_enabled = bool(args.minimou_power)
         self.minimou_control_enabled = bool(args.minimou_control)
         self.minimou_workspace_scale = self._clamp_minimou_workspace_scale(args.minimou_workspace_scale)
+        self.minimou_workspace_follows_camera = bool(args.minimou_workspace_follows_camera)
         self.minimou_workspace_pos_offset = self._vec3_arg(
             args.minimou_workspace_pos_offset,
             "MiniMou workspace position offset",
@@ -799,6 +815,10 @@ class Example:
         self.fem_soft_contact_margin = min(
             max(float(args.fem_soft_contact_margin), FEM_SOFT_CONTACT_MARGIN_MIN),
             FEM_SOFT_CONTACT_MARGIN_MAX,
+        )
+        self.fem_global_damping = min(
+            max(float(args.fem_global_damping), FEM_GLOBAL_DAMPING_MIN),
+            FEM_GLOBAL_DAMPING_MAX,
         )
         self.device_particle_radius = min(
             max(float(args.device_particle_radius), DEVICE_PARTICLE_RADIUS_MIN),
@@ -972,6 +992,7 @@ class Example:
         self.placement_particle_indices: wp.array[wp.int32] | None = None
         self.placement_rest_local_q: wp.array[wp.vec3] | None = None
         self.placement_target_q: wp.array[wp.vec3] | None = None
+        self.placement_target_qd: wp.array[wp.vec3] | None = None
         self.placement_prev_target_q: wp.array[wp.vec3] | None = None
         self.placement_render_particle_flags: wp.array[wp.int32] | None = None
         self.placement_clone_count = 0
@@ -1189,6 +1210,11 @@ class Example:
 
         self._request_minimou_takeover()
 
+    def _toggle_minimou_control_handle(self):
+        self._set_minimou_control_enabled(not self.minimou_control_enabled)
+        state = "enabled" if self.minimou_control_enabled else "disabled"
+        print(f"Control Handle {state}.")
+
     def _request_minimou_takeover(self):
         self.minimou_takeover_requested = True
         self.minimou_anchor_device_transform = None
@@ -1223,9 +1249,48 @@ class Example:
             self.minimou_status = "Tracking" if self.minimou_control_enabled else "Connected"
         return sample
 
+    def _camera_workspace_transform(self) -> wp.transform | None:
+        camera = getattr(self.viewer, "camera", None)
+        if camera is None:
+            return None
+
+        try:
+            position = np.asarray(camera.pos, dtype=np.float32)
+            right = np.asarray(camera.get_right(), dtype=np.float32)
+            forward = np.asarray(camera.get_front(), dtype=np.float32)
+            up = np.asarray(camera.get_up(), dtype=np.float32)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+        if position.shape != (3,) or right.shape != (3,) or forward.shape != (3,) or up.shape != (3,):
+            return None
+        if not np.all(np.isfinite(position)) or not np.all(np.isfinite(right + forward + up)):
+            return None
+
+        right_norm = float(np.linalg.norm(right))
+        forward_norm = float(np.linalg.norm(forward))
+        up_norm = float(np.linalg.norm(up))
+        if min(right_norm, forward_norm, up_norm) < 1.0e-8:
+            return None
+
+        right /= right_norm
+        forward /= forward_norm
+        up /= up_norm
+        rotation = wp.quat_from_matrix(
+            wp.matrix_from_cols(
+                wp.vec3(float(right[0]), float(right[1]), float(right[2])),
+                wp.vec3(float(forward[0]), float(forward[1]), float(forward[2])),
+                wp.vec3(float(up[0]), float(up[1]), float(up[2])),
+            )
+        )
+        return wp.transform(
+            wp.vec3(float(position[0]), float(position[1]), float(position[2])),
+            rotation,
+        )
+
     def _minimou_workspace_transform(self) -> wp.transform:
         roll, pitch, yaw = (math.radians(float(value)) for value in self.minimou_workspace_rot_offset_deg)
-        return wp.transform(
+        workspace = wp.transform(
             wp.vec3(
                 float(self.minimou_workspace_pos_offset[0]),
                 float(self.minimou_workspace_pos_offset[1]),
@@ -1233,6 +1298,13 @@ class Example:
             ),
             wp.quat_rpy(roll, pitch, yaw),
         )
+        if not self.minimou_workspace_follows_camera:
+            return workspace
+
+        camera_transform = self._camera_workspace_transform()
+        if camera_transform is None:
+            return workspace
+        return wp.transform_multiply(camera_transform, workspace)
 
     def _minimou_sample_transform(self, sample: dict) -> wp.transform:
         position = np.asarray(sample["position"], dtype=np.float32)
@@ -1319,6 +1391,7 @@ class Example:
         self.placement_particle_indices = wp.array(particle_indices, dtype=wp.int32, device=self.model.device)
         self.placement_rest_local_q = wp.array(rest_local_q, dtype=wp.vec3, device=self.model.device)
         self.placement_target_q = wp.zeros(self.placement_clone_count, dtype=wp.vec3, device=self.model.device)
+        self.placement_target_qd = wp.zeros(self.placement_clone_count, dtype=wp.vec3, device=self.model.device)
         self.placement_prev_target_q = wp.zeros(self.placement_clone_count, dtype=wp.vec3, device=self.model.device)
         self._refresh_placement_render_particle_flags()
         self._reset_placement_clone_targets()
@@ -1362,7 +1435,8 @@ class Example:
             self._last_placement_control_scale = current_scale.copy()
 
     def _reset_placement_clone_targets(self):
-        self._update_placement_clone_targets(reset_previous=True)
+        self._sync_placement_control_buffers(force=True)
+        self._update_placement_clone_target_kinematics(reset_previous=True)
 
     def _update_placement_clone_targets(self, reset_previous: bool):
         if self.placement_clone_count == 0:
@@ -1383,6 +1457,26 @@ class Example:
             device=self.model.device,
         )
 
+    def _update_placement_clone_target_kinematics(self, reset_previous: bool):
+        if self.placement_clone_count == 0:
+            return
+
+        wp.launch(
+            kernel=update_device_clone_target_kinematics,
+            dim=self.placement_clone_count,
+            inputs=[
+                self.placement_rest_local_q,
+                self.placement_target_q,
+                self.placement_target_qd,
+                self.placement_prev_target_q,
+                self.placement_control_transform,
+                self.placement_control_scale,
+                self.frame_dt,
+                int(reset_previous),
+            ],
+            device=self.model.device,
+        )
+
     def _apply_interactive_placement_forces(self):
         if not self._use_interactive_placement() or self.placement_clone_count == 0:
             return
@@ -1392,18 +1486,14 @@ class Example:
             dim=self.placement_clone_count,
             inputs=[
                 self.placement_particle_indices,
-                self.placement_rest_local_q,
                 self.placement_target_q,
-                self.placement_prev_target_q,
+                self.placement_target_qd,
                 self.state_0.particle_q,
                 self.state_0.particle_qd,
                 self.state_0.particle_f,
-                self.placement_control_transform,
-                self.placement_control_scale,
                 self.placement_clone_stiffness,
                 self.placement_clone_damping,
                 self.placement_max_clone_force,
-                self.sim_dt,
             ],
             device=self.model.device,
         )
@@ -1476,6 +1566,15 @@ class Example:
             self.solver._contact_mu = self.fem_soft_contact_mu
         self._mark_graph_recapture()
 
+    def _apply_fem_global_damping(self):
+        if self.solver_type != "fem":
+            return
+        if hasattr(self.solver, "k_damp"):
+            self.solver.k_damp = self.fem_global_damping
+        else:
+            self.solver._k_damp = self.fem_global_damping
+        self._mark_graph_recapture()
+
     def _apply_device_particle_radius(self):
         particle_radius = self.model.particle_radius.numpy()
         particle_radius[self.device_particle_start : self.device_particle_start + self.device_particle_count] = (
@@ -1496,6 +1595,7 @@ class Example:
             return newton.solvers.SolverFEM(
                 model=self.model,
                 iterations=self.iterations,
+                k_damp=self.fem_global_damping,
                 plane_contact_projection_iterations=1,
                 particle_drag_projection_iterations=1,
                 fp64=self.fp64,
@@ -1579,6 +1679,8 @@ class Example:
         self._update_minimou_controlled_gizmo()
         if self._interactive_placement_available():
             self._sync_placement_control_buffers()
+            if self._use_interactive_placement():
+                self._update_placement_clone_target_kinematics(reset_previous=False)
 
         if self._needs_graph_recapture:
             self.capture()
@@ -1974,6 +2076,16 @@ class Example:
             self._toggle_gravity()
         self._gravity_key_was_down = gravity_down
 
+        control_handle_down = bool(self.viewer.is_key_down("v"))
+        if control_handle_down and not self._control_handle_key_was_down:
+            self._toggle_minimou_control_handle()
+        self._control_handle_key_was_down = control_handle_down
+
+        reset_offset_down = bool(self.viewer.is_key_down("o"))
+        if reset_offset_down and not self._reset_offset_key_was_down:
+            self._reset_minimou_handle_offset()
+        self._reset_offset_key_was_down = reset_offset_down
+
     def _toggle_gravity(self):
         self._gravity_enabled = not self._gravity_enabled
         if self._gravity_enabled:
@@ -2206,6 +2318,12 @@ class Example:
         changed, control = ui.checkbox("Control Handle", self.minimou_control_enabled)
         if changed:
             self._set_minimou_control_enabled(bool(control))
+
+        changed, follows_camera = ui.checkbox("Camera Input Space", self.minimou_workspace_follows_camera)
+        if changed:
+            self.minimou_workspace_follows_camera = bool(follows_camera)
+            if self.minimou_control_enabled:
+                self._request_minimou_takeover()
 
         if self.minimou_control_enabled and ui.button("Reset Offset"):
             self._reset_minimou_handle_offset()
@@ -2672,6 +2790,21 @@ class Example:
             self.solver.iterations = self.iterations
             self._mark_graph_recapture()
 
+        if self.solver_type == "fem":
+            changed, value = ui.slider_float(
+                "FEM Global Damping",
+                self.fem_global_damping,
+                FEM_GLOBAL_DAMPING_MIN,
+                FEM_GLOBAL_DAMPING_MAX,
+                "%.1f",
+            )
+            if changed:
+                self.fem_global_damping = min(
+                    max(float(value), FEM_GLOBAL_DAMPING_MIN),
+                    FEM_GLOBAL_DAMPING_MAX,
+                )
+                self._apply_fem_global_damping()
+
         if hasattr(ui, "input_int"):
             changed, value = ui.input_int("Stiffness 10^n", self.tet_stiffness_exponent, 1, 1)
         else:
@@ -2735,6 +2868,12 @@ class Example:
             "--fp64",
             help="Request double precision for the FEM solver (currently falls back to fp32 with a warning).",
             action="store_true",
+        )
+        parser.add_argument(
+            "--fem-global-damping",
+            help="FEM global mass-proportional viscous damping coefficient [1/s].",
+            type=float,
+            default=1.0,
         )
         parser.add_argument(
             "--scale",
@@ -2964,6 +3103,12 @@ class Example:
             help="Scale applied to MiniMou workspace position deltas.",
             type=float,
             default=0.001,
+        )
+        parser.add_argument(
+            "--minimou-workspace-follows-camera",
+            help="Make the MiniMou input space move and rotate with the viewer camera.",
+            action=argparse.BooleanOptionalAction,
+            default=False,
         )
         parser.add_argument(
             "--minimou-workspace-pos-offset",

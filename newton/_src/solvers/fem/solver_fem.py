@@ -119,7 +119,7 @@ class SolverFEM(SolverBase):
             Defaults to per-element values from ``model.tet_materials[:, 0]``.
         k_lambda: Optional scalar override for the second Lamé parameter λ [Pa].
             Defaults to per-element values from ``model.tet_materials[:, 1]``.
-        k_damp: Mass-proportional velocity damping coefficient [1/s].
+        k_damp: Global mass-proportional viscous damping coefficient [1/s].
             Default ``0.0``.
         contact_ke: Soft-contact stiffness [N/m]. Defaults to
             ``model.soft_contact_ke``.
@@ -178,7 +178,7 @@ class SolverFEM(SolverBase):
             )
 
         self.iterations = max(1, int(iterations))
-        self._k_damp = float(k_damp)
+        self.k_damp = k_damp
         self._cg_tol = float(cg_tol)
         self._cg_max_iters = int(cg_max_iters)
         self.plane_contact_projection_iterations = max(0, int(plane_contact_projection_iterations))
@@ -257,6 +257,18 @@ class SolverFEM(SolverBase):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def k_damp(self) -> float:
+        """Global mass-proportional viscous damping coefficient [1/s]."""
+        return self._k_damp
+
+    @k_damp.setter
+    def k_damp(self, value: float) -> None:
+        value = float(value)
+        if value < 0.0:
+            raise ValueError("k_damp must be non-negative.")
+        self._k_damp = value
 
     @override
     def step(

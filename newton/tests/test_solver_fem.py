@@ -146,6 +146,29 @@ def test_fem_material_refresh_changes_deformation(test, device):
     test.assertGreater(stiff_q[3, 2], soft_q[3, 2])
 
 
+def test_fem_global_damping_damps_velocity(test, device):
+    model = _build_single_tet_model(device, gravity=0.0, k_mu=0.0, k_lambda=0.0)
+    state_in = model.state()
+    velocity = np.zeros((model.particle_count, 3), dtype=np.float32)
+    velocity[:, 0] = 1.0
+    state_in.particle_qd.assign(velocity)
+
+    solver = newton.solvers.SolverFEM(model, iterations=1, k_damp=10.0, cg_tol=1.0e-7, cg_max_iters=128)
+    test.assertEqual(solver.k_damp, 10.0)
+    with test.assertRaises(ValueError):
+        solver.k_damp = -1.0
+
+    solver.k_damp = 5.0
+    state_out = model.state()
+    solver.step(state_in, state_out, None, None, 0.1)
+    qd = state_out.particle_qd.numpy()
+
+    expected_x = 1.0 / (1.0 + solver.k_damp * 0.1)
+    np.testing.assert_allclose(qd[:, 0], expected_x, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(qd[:, 1:], 0.0, rtol=0.0, atol=1.0e-7)
+    test.assertLess(float(np.linalg.norm(qd)), float(np.linalg.norm(velocity)))
+
+
 def test_fem_plane_projection_clamps_ground_penetration(test, device):
     radius = 0.1
     model = _build_single_tet_model(device, gravity=0.0, pos_z=-0.25, add_ground=True, particle_radius=radius)
@@ -273,6 +296,12 @@ add_function_test(
     TestSolverFEM,
     "test_fem_material_refresh_changes_deformation",
     test_fem_material_refresh_changes_deformation,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEM,
+    "test_fem_global_damping_damps_velocity",
+    test_fem_global_damping_damps_velocity,
     devices=devices,
 )
 add_function_test(
